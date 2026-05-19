@@ -47,7 +47,7 @@ input string   InpComment          = "GridScalper"; // Order Comment
 input ENUM_GRID_FROM InpGridFrom   = Grid_From_LastOrder; // Grid Reference
 
 input group "=== Grid Settings ==="
-input double   InpGridSize         = 10.0;         // Grid Step Size (points)
+input double   InpGridSize         = 200.0;        // Grid Step Size (points)
 input bool     InpUseATRGridSize   = false;        // Use ATR-Based Grid Size
 input int      InpATRPeriod        = 14;           // ATR Period
 input double   InpATRMultiplier    = 1.0;          // ATR Multiplier
@@ -131,21 +131,26 @@ double g_atr[];
 
 datetime g_lastTradeTime = 0;
 datetime g_lastBasketCloseTime = 0;
-double   g_basketTrailingLevel = 0;
+double   g_buyBasketTrailingLevel = 0;
+double   g_sellBasketTrailingLevel = 0;
 int g_totalTrades = 0;
 int g_winTrades = 0;
 double g_totalProfit = 0;
 
 string g_dashboardName = "GridScalper_Dashboard";
+double g_pipMultiplier = 1.0;
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                     |
 //+------------------------------------------------------------------+
 int OnInit()
 {
+   //--- Calculate pip multiplier for 3/5 digit brokers
+   g_pipMultiplier = (_Digits == 3 || _Digits == 5) ? 10.0 : 1.0;
+
    //--- Set up trade object
    g_trade.SetExpertMagicNumber(InpMagicNumber);
-   g_trade.SetDeviationInPoints(10);
+   g_trade.SetDeviationInPoints((int)(10 * g_pipMultiplier));
    g_trade.SetTypeFilling(GetFillingMode());
 
    //--- Create indicator handles
@@ -238,6 +243,9 @@ void OnTick()
    double buyRefPrice = GetGridReferencePrice(POSITION_TYPE_BUY);
    double sellRefPrice = GetGridReferencePrice(POSITION_TYPE_SELL);
 
+   bool buyGridSignal = IsNewGridLevel(POSITION_TYPE_BUY, SymbolInfoDouble(_Symbol, SYMBOL_BID), gridStepPrice);
+   bool sellGridSignal = IsNewGridLevel(POSITION_TYPE_SELL, SymbolInfoDouble(_Symbol, SYMBOL_ASK), gridStepPrice);
+
    if(InpGeometryGuard)
    {
       if(buyCount >= InpMaxBuys || sellCount >= InpMaxSells || totalOrders >= InpMaxTotal)
@@ -253,10 +261,7 @@ void OnTick()
       return;
    }
 
-   bool buyGridSignal = IsNewGridLevel(POSITION_TYPE_BUY, SymbolInfoDouble(_Symbol, SYMBOL_BID), gridStepPrice);
-   bool sellGridSignal = IsNewGridLevel(POSITION_TYPE_SELL, SymbolInfoDouble(_Symbol, SYMBOL_ASK), gridStepPrice);
-
-   if(newBar || buyGridSignal)
+   if((buyCount == 0 && newBar) || buyGridSignal)
    {
       if(CheckBuySignal(buyCount))
       {
@@ -265,7 +270,7 @@ void OnTick()
       }
    }
 
-   if(newBar || sellGridSignal)
+   if((sellCount == 0 && newBar) || sellGridSignal)
    {
       if(CheckSellSignal(sellCount))
       {
@@ -294,44 +299,48 @@ bool CopyIndicatorBuffers()
 
 bool CheckBuySignal(int currentBuyCount)
 {
-   if(currentBuyCount == 0 && InpMAMode != MA_Disabled)
+   if(currentBuyCount == 0)
    {
-      double close0 = iClose(_Symbol, PERIOD_CURRENT, 0);
-      double close1 = iClose(_Symbol, PERIOD_CURRENT, 1);
-      bool maBiasBullish = false;
-      switch(InpMAMode)
+      if(InpMAMode != MA_Disabled)
       {
-         case MA_Price_Cross: if(close1 <= g_maFast[1] && close0 > g_maFast[0]) maBiasBullish = true; break;
-         case MA_Slope_Filter: if(g_maFast[0] > g_maFast[1]) maBiasBullish = true; break;
-         case MA_Trend_Follow: if(g_maFast[0] > g_maSlow[0] && g_maFast[0] > g_maFast[1]) maBiasBullish = true; break;
-         default: maBiasBullish = true; break;
+         double close0 = iClose(_Symbol, PERIOD_CURRENT, 0);
+         double close1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+         bool maBiasBullish = false;
+         switch(InpMAMode)
+         {
+            case MA_Price_Cross: if(close1 <= g_maFast[1] && close0 > g_maFast[0]) maBiasBullish = true; break;
+            case MA_Slope_Filter: if(g_maFast[0] > g_maFast[1]) maBiasBullish = true; break;
+            case MA_Trend_Follow: if(g_maFast[0] > g_maSlow[0] && g_maFast[0] > g_maFast[1]) maBiasBullish = true; break;
+            default: maBiasBullish = true; break;
+         }
+         if(!maBiasBullish) return false;
       }
-      if(!maBiasBullish) return false;
+      if(InpUseRSI && g_rsi[0] >= InpRSIOverbought) return false;
    }
-   if(InpUseRSI && g_rsi[0] >= InpRSIOverbought) return false;
-   if(currentBuyCount == 0) return true;
-   return IsNewGridLevel(POSITION_TYPE_BUY, SymbolInfoDouble(_Symbol, SYMBOL_BID), GetGridStep() * _Point);
+   return true;
 }
 
 bool CheckSellSignal(int currentSellCount)
 {
-   if(currentSellCount == 0 && InpMAMode != MA_Disabled)
+   if(currentSellCount == 0)
    {
-      double close0 = iClose(_Symbol, PERIOD_CURRENT, 0);
-      double close1 = iClose(_Symbol, PERIOD_CURRENT, 1);
-      bool maBiasBearish = false;
-      switch(InpMAMode)
+      if(InpMAMode != MA_Disabled)
       {
-         case MA_Price_Cross: if(close1 >= g_maFast[1] && close0 < g_maFast[0]) maBiasBearish = true; break;
-         case MA_Slope_Filter: if(g_maFast[0] < g_maFast[1]) maBiasBearish = true; break;
-         case MA_Trend_Follow: if(g_maFast[0] < g_maSlow[0] && g_maFast[0] < g_maFast[1]) maBiasBearish = true; break;
-         default: maBiasBearish = true; break;
+         double close0 = iClose(_Symbol, PERIOD_CURRENT, 0);
+         double close1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+         bool maBiasBearish = false;
+         switch(InpMAMode)
+         {
+            case MA_Price_Cross: if(close1 >= g_maFast[1] && close0 < g_maFast[0]) maBiasBearish = true; break;
+            case MA_Slope_Filter: if(g_maFast[0] < g_maFast[1]) maBiasBearish = true; break;
+            case MA_Trend_Follow: if(g_maFast[0] < g_maSlow[0] && g_maFast[0] < g_maFast[1]) maBiasBearish = true; break;
+            default: maBiasBearish = true; break;
+         }
+         if(!maBiasBearish) return false;
       }
-      if(!maBiasBearish) return false;
+      if(InpUseRSI && g_rsi[0] <= InpRSIOversold) return false;
    }
-   if(InpUseRSI && g_rsi[0] <= InpRSIOversold) return false;
-   if(currentSellCount == 0) return true;
-   return IsNewGridLevel(POSITION_TYPE_SELL, SymbolInfoDouble(_Symbol, SYMBOL_ASK), GetGridStep() * _Point);
+   return true;
 }
 
 bool IsNewGridLevel(ENUM_POSITION_TYPE posType, double price, double gridStepPrice)
@@ -473,65 +482,92 @@ void ManageBreakEven()
    }
 }
 
+//--- Forward declaration
+void ManageSideBasket(ENUM_POSITION_TYPE posType, double &trailingLevel);
+
 void CheckBasketTPSL()
 {
    double totalProfit = GetTotalProfit();
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+
+   // Hard Equity SL (Total Account Risk)
    if(InpMaxEquityRiskPercent > 0 && balance > 0 && (-totalProfit) >= balance * InpMaxEquityRiskPercent / 100.0)
    {
       CloseAllPositions();
       g_lastBasketCloseTime = TimeCurrent();
       return;
    }
+
+   // Independent Buy Basket
+   ManageSideBasket(POSITION_TYPE_BUY, g_buyBasketTrailingLevel);
+
+   // Independent Sell Basket
+   ManageSideBasket(POSITION_TYPE_SELL, g_sellBasketTrailingLevel);
+}
+
+void ManageSideBasket(ENUM_POSITION_TYPE posType, double &trailingLevel)
+{
+   double profit = GetTotalProfit(posType);
+   if(profit == 0) { trailingLevel = 0; return; }
+
    if(InpUseBasketTP)
    {
-      if(totalProfit >= InpBasketTP)
+      if(profit >= InpBasketTP)
       {
-         if(totalProfit >= InpBasketTrailingStart)
+         if(profit >= InpBasketTrailingStart)
          {
-            double newTrail = totalProfit - InpBasketTrailingStep;
-            if(g_basketTrailingLevel == 0 || newTrail > g_basketTrailingLevel) g_basketTrailingLevel = newTrail;
+            double newTrail = profit - InpBasketTrailingStep;
+            if(trailingLevel == 0 || newTrail > trailingLevel) trailingLevel = newTrail;
          }
-         if(g_basketTrailingLevel > 0 && totalProfit <= g_basketTrailingLevel)
+
+         if(trailingLevel > 0 && profit <= trailingLevel)
          {
-            CloseAllPositions();
+            CloseAllPositions(posType);
             g_lastBasketCloseTime = TimeCurrent();
-            g_basketTrailingLevel = 0;
+            trailingLevel = 0;
             return;
          }
-         if(g_basketTrailingLevel == 0)
+
+         if(trailingLevel == 0)
          {
-            CloseAllPositions();
+            CloseAllPositions(posType);
             g_lastBasketCloseTime = TimeCurrent();
             return;
          }
       }
-      else if(totalProfit < 0) g_basketTrailingLevel = 0;
+      else if(profit < 0) trailingLevel = 0;
    }
-   if(InpUseBasketSL && totalProfit <= -InpBasketSL)
+
+   if(InpUseBasketSL && profit <= -InpBasketSL)
    {
-      CloseAllPositions();
+      CloseAllPositions(posType);
       g_lastBasketCloseTime = TimeCurrent();
    }
 }
 
-double GetTotalProfit()
+double GetTotalProfit(int posType = -1)
 {
    double profit = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
-         profit += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+      {
+         if(posType == -1 || PositionGetInteger(POSITION_TYPE) == posType)
+            profit += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+      }
    }
    return profit;
 }
 
-void CloseAllPositions()
+void CloseAllPositions(int posType = -1)
 {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
-         g_trade.PositionClose(PositionGetTicket(i));
+      {
+         if(posType == -1 || PositionGetInteger(POSITION_TYPE) == posType)
+            g_trade.PositionClose(PositionGetTicket(i));
+      }
    }
 }
 
@@ -638,17 +674,49 @@ void DrawGridLines()
 {
    ObjectsDeleteAll(0, "GridLine_");
    double gridStepPrice = GetGridStep() * _Point;
-   double refPrice = GetGridReferencePrice(POSITION_TYPE_BUY);
-   double topPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID) + gridStepPrice * 20;
-   double botPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID) - gridStepPrice * 20;
-   double startPrice = refPrice + MathCeil((topPrice - refPrice) / gridStepPrice) * gridStepPrice;
+   if(gridStepPrice <= 0) return;
+
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   double buyRef = GetGridReferencePrice(POSITION_TYPE_BUY);
+   double sellRef = GetGridReferencePrice(POSITION_TYPE_SELL);
+
+   // Draw next Buy Level (Below last buy or current bid)
+   double nextBuy = buyRef - gridStepPrice;
+   DrawSingleGridLine("GridLine_Buy", nextBuy, clrLime);
+
+   // Draw next Sell Level (Above last sell or current ask)
+   double nextSell = sellRef + gridStepPrice;
+   DrawSingleGridLine("GridLine_Sell", nextSell, clrRed);
+
+   // Draw general grid lines around current price
+   double topPrice = bid + gridStepPrice * 10;
+   double botPrice = bid - gridStepPrice * 10;
+   double startPrice = buyRef + MathCeil((topPrice - buyRef) / gridStepPrice) * gridStepPrice;
+
    for(double p = startPrice; p >= botPrice; p -= gridStepPrice)
    {
-      string lineName = "GridLine_" + DoubleToString(p, _Digits);
-      ObjectCreate(0, lineName, OBJ_HLINE, 0, 0, p);
-      ObjectSetInteger(0, lineName, OBJPROP_COLOR, InpGridColor);
-      ObjectSetInteger(0, lineName, OBJPROP_STYLE, STYLE_DOT);
-      ObjectSetInteger(0, lineName, OBJPROP_BACK, true);
+      string lineName = "GridLine_Step_" + DoubleToString(p, _Digits);
+      if(ObjectFind(0, lineName) < 0)
+      {
+         ObjectCreate(0, lineName, OBJ_HLINE, 0, 0, p);
+         ObjectSetInteger(0, lineName, OBJPROP_COLOR, InpGridColor);
+         ObjectSetInteger(0, lineName, OBJPROP_STYLE, STYLE_DOT);
+         ObjectSetInteger(0, lineName, OBJPROP_BACK, true);
+      }
    }
    ChartRedraw(0);
+}
+
+void DrawSingleGridLine(string name, double price, color clr)
+{
+   if(ObjectFind(0, name) < 0)
+      ObjectCreate(0, name, OBJ_HLINE, 0, 0, price);
+
+   ObjectSetDouble(0, name, OBJPROP_PRICE, price);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, name, OBJPROP_BACK, true);
 }
