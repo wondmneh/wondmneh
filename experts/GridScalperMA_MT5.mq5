@@ -1,17 +1,18 @@
 //+------------------------------------------------------------------+
 //|                                           GridScalperMA_MT5.mq5  |
-//|                        Grid Scalper MA - Fixed Edition v2.1      |
+//|                        Grid Scalper MA - Fixed Edition v2.2      |
 //|                                                                  |
 //+------------------------------------------------------------------+
 #property copyright "Grid Scalper MA"
 #property link      ""
-#property version   "2.10"
+#property version   "2.20"
 #property description "Grid Scalper with Moving Average filter"
 #property description "Fixed: MA filter no longer blocks grid entries"
 #property description "Fixed: Dynamic ORDER_FILLING detection"
 #property description "Fixed: Reliable grid level detection"
 #property description "Fixed: Independent Buy/Sell grid tracking"
 #property description "Added: Hard Equity protection and Trailing Basket TP"
+#property description "Fixed: Risk controls run on every tick, even when entries are blocked"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -42,7 +43,7 @@ enum ENUM_GRID_FROM
 input group "=== Main Settings ==="
 input ulong    InpMagicNumber      = 777007;      // Magic Number
 input bool     InpAutoTrading      = true;         // Enable Auto Trading
-input int      InpMaxOpenOrders    = 20;           // Max Open Orders (per side)
+input int      InpMaxOpenOrders    = 20;           // Max Open Orders (total)
 input string   InpComment          = "GridScalper"; // Order Comment
 input ENUM_GRID_FROM InpGridFrom   = Grid_From_LastOrder; // Grid Reference
 
@@ -93,10 +94,10 @@ input int      InpCooldownSec      = 300;          // Cooldown After Basket Clos
 input group "=== Risk Management ==="
 input double   InpMaxEquityRiskPercent = 20.0;     // Max Equity Risk %
 input double   InpDailyProfitTarget = 0.0;         // Daily Profit Target ($, 0=off)
-input double   InpDailyLossLimit   = 50.0;         // Daily Loss Limit ($)
+input double   InpDailyLossLimit   = 50.0;         // Daily Loss Limit ($, closed + open, 0=off)
 input bool     InpUseTrailingStop  = false;        // Use Trailing Stop
 input int      InpTrailingStart    = 15;           // Trailing Start (points)
-input int      InpTrailingStep     = 5;            // Trailing Step (points)
+input int      InpTrailingStep     = 5;            // Trailing Distance (points)
 input bool     InpUseBreakEven     = false;        // Use Break Even
 input int      InpBreakEvenStart   = 10;           // Break Even Start (points)
 input int      InpBreakEvenProfit  = 3;            // Break Even Profit (points)
@@ -106,6 +107,7 @@ input bool     InpUseTradingHours  = false;        // Enable Trading Hours
 input int      InpStartHour        = 8;            // Start Hour (server)
 input int      InpEndHour          = 20;           // End Hour (server)
 input bool     InpCloseOnFriday    = false;        // Close All on Friday
+input int      InpFridayCloseHour  = 21;           // Friday Close Hour (server)
 
 input group "=== Dashboard ==="
 input bool     InpShowDashboard    = true;         // Show Dashboard
@@ -148,6 +150,19 @@ int OnInit()
    g_trade.SetDeviationInPoints(10);
    g_trade.SetTypeFilling(GetFillingMode());
 
+   //--- Reject settings that would make the grid fire on every tick
+   if(InpGridSize <= 0 || InpFixedLot <= 0)
+   {
+      Print("ERROR: Grid Step Size and Fixed Lot Size must be above zero.");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+   //--- A two-sided grid needs separate buy and sell positions
+   if((ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE) != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
+   {
+      Print("ERROR: This EA needs a hedging account. Netting accounts merge positions and break the grid.");
+      return(INIT_FAILED);
+   }
+
    //--- Create indicator handles
    g_maFastHandle = iMA(_Symbol, PERIOD_CURRENT, InpFastMA, 0, InpMAMethod, InpMAPrice);
    g_maSlowHandle = iMA(_Symbol, PERIOD_CURRENT, InpSlowMA, 0, InpMAMethod, InpMAPrice);
@@ -170,6 +185,12 @@ int OnInit()
       return(INIT_FAILED);
    }
 
+   if(InpUseATRGridSize && g_atrHandle == INVALID_HANDLE)
+   {
+      Print("ERROR: Failed to create ATR indicator handle!");
+      return(INIT_FAILED);
+   }
+
    //--- Set arrays as series
    ArraySetAsSeries(g_maFast, true);
    ArraySetAsSeries(g_maSlow, true);
@@ -184,7 +205,7 @@ int OnInit()
    if(InpShowGridLines)
       DrawGridLines();
 
-   Print("Grid Scalper MA v2.1 initialized on ", _Symbol);
+   Print("Grid Scalper MA v2.2 initialized on ", _Symbol);
 
    return(INIT_SUCCEEDED);
 }
@@ -212,72 +233,50 @@ void OnDeinit(const int reason)
 void OnTick()
 {
    if(!InpAutoTrading) return;
-   if(!CopyIndicatorBuffers()) return;
-   if(!CheckTradingHours()) return;
-   if(!CheckDailyLimits()) return;
 
-   if(g_lastBasketCloseTime > 0)
-   {
-      if((int)(TimeCurrent() - g_lastBasketCloseTime) < InpCooldownSec) return;
-   }
-
+   //--- Protection first: it must run on every tick, even when new entries are blocked
+   bool entriesAllowed = CheckDailyLimits();
+   if(!CheckFridayClose()) entriesAllowed = false;
    CheckBasketTPSL();
+   if(InpUseTrailingStop) ManageTrailingStop();
+   if(InpUseBreakEven)    ManageBreakEven();
 
    static datetime lastBarTime = 0;
    datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
    bool newBar = (currentBarTime != lastBarTime);
    if(newBar) lastBarTime = currentBarTime;
 
-   double gridStep = GetGridStep();
-   double gridStepPrice = gridStep * _Point;
+   bool buffersOk = CopyIndicatorBuffers();
+   double gridStepPrice = GetGridStep() * _Point;
 
    int buyCount = CountPositionsByType(POSITION_TYPE_BUY);
    int sellCount = CountPositionsByType(POSITION_TYPE_SELL);
    int totalOrders = buyCount + sellCount;
 
-   double buyRefPrice = GetGridReferencePrice(POSITION_TYPE_BUY);
-   double sellRefPrice = GetGridReferencePrice(POSITION_TYPE_SELL);
-
-   if(InpGeometryGuard)
-   {
-      if(buyCount >= InpMaxBuys || sellCount >= InpMaxSells || totalOrders >= InpMaxTotal)
-      {
-         if(InpShowDashboard) UpdateDashboard(buyCount, sellCount, gridStepPrice, buyRefPrice);
-         return;
-      }
-   }
-
-   if(totalOrders >= InpMaxOpenOrders)
-   {
-      if(InpShowDashboard) UpdateDashboard(buyCount, sellCount, gridStepPrice, buyRefPrice);
-      return;
-   }
-
-   bool buyGridSignal = IsNewGridLevel(POSITION_TYPE_BUY, SymbolInfoDouble(_Symbol, SYMBOL_BID), gridStepPrice);
-   bool sellGridSignal = IsNewGridLevel(POSITION_TYPE_SELL, SymbolInfoDouble(_Symbol, SYMBOL_ASK), gridStepPrice);
-
-   if(newBar || buyGridSignal)
-   {
-      if(CheckBuySignal(buyCount))
-      {
-         double lot = CalculateLotSize(POSITION_TYPE_BUY, buyCount);
-         if(lot > 0) OpenTrade(ORDER_TYPE_BUY, lot, InpTakeProfit, InpStopLoss);
-      }
-   }
-
-   if(newBar || sellGridSignal)
-   {
-      if(CheckSellSignal(sellCount))
-      {
-         double lot = CalculateLotSize(POSITION_TYPE_SELL, sellCount);
-         if(lot > 0) OpenTrade(ORDER_TYPE_SELL, lot, InpTakeProfit, InpStopLoss);
-      }
-   }
-
-   if(InpUseTrailingStop) ManageTrailingStop();
-   if(InpUseBreakEven)    ManageBreakEven();
-   if(InpShowDashboard)   UpdateDashboard(buyCount, sellCount, gridStepPrice, buyRefPrice);
+   if(InpShowDashboard) UpdateDashboard(buyCount, sellCount, gridStepPrice, GetGridReferencePrice(POSITION_TYPE_BUY));
    if(InpShowGridLines && newBar) DrawGridLines();
+
+   //--- Entry gates
+   if(!entriesAllowed || !buffersOk) return;
+   if(!CheckTradingHours()) return;
+   if(g_lastBasketCloseTime > 0 && (int)(TimeCurrent() - g_lastBasketCloseTime) < InpCooldownSec) return;
+
+   //--- A full side only blocks that side, not the whole grid
+   int maxTotal = InpGeometryGuard ? MathMin(InpMaxOpenOrders, InpMaxTotal) : InpMaxOpenOrders;
+   bool buyAllowed  = (!InpGeometryGuard || buyCount < InpMaxBuys);
+   bool sellAllowed = (!InpGeometryGuard || sellCount < InpMaxSells);
+
+   if(buyAllowed && totalOrders < maxTotal && CheckBuySignal(buyCount))
+   {
+      double lot = CalculateLotSize(POSITION_TYPE_BUY, buyCount);
+      if(lot > 0 && OpenTrade(ORDER_TYPE_BUY, lot, InpTakeProfit, InpStopLoss)) totalOrders++;
+   }
+
+   if(sellAllowed && totalOrders < maxTotal && CheckSellSignal(sellCount))
+   {
+      double lot = CalculateLotSize(POSITION_TYPE_SELL, sellCount);
+      if(lot > 0 && OpenTrade(ORDER_TYPE_SELL, lot, InpTakeProfit, InpStopLoss)) totalOrders++;
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -336,9 +335,9 @@ bool CheckSellSignal(int currentSellCount)
 
 bool IsNewGridLevel(ENUM_POSITION_TYPE posType, double price, double gridStepPrice)
 {
-   if(gridStepPrice <= 0) return true;
    double lastPrice = GetLastPositionPrice(posType);
    if(lastPrice <= 0) return true;
+   if(gridStepPrice <= 0) return false;
    return (posType == POSITION_TYPE_BUY) ? (price <= lastPrice - gridStepPrice) : (price >= lastPrice + gridStepPrice);
 }
 
@@ -354,7 +353,7 @@ double GetGridReferencePrice(ENUM_POSITION_TYPE posType)
 
 double GetGridStep()
 {
-   if(InpUseATRGridSize && g_atrHandle != INVALID_HANDLE)
+   if(InpUseATRGridSize && ArraySize(g_atr) > 0)
    {
       double atrValue = g_atr[0];
       if(atrValue > 0) return MathMax(atrValue / _Point * InpATRMultiplier, 1.0);
@@ -373,9 +372,10 @@ double CalculateLotSize(ENUM_POSITION_TYPE posType, int currentCount)
          double balance = AccountInfoDouble(ACCOUNT_BALANCE);
          double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
          double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-         double slPoints = (InpStopLoss > 0) ? InpStopLoss : InpGridSize * 3;
+         double slPoints = (InpStopLoss > 0) ? InpStopLoss : GetGridStep() * 3;
          double riskMoney = balance * InpRiskPercent / 100.0;
-         if(tickValue > 0 && tickSize > 0) lot = riskMoney / (slPoints * tickValue * (tickSize / _Point));
+         //--- Money lost per lot over the stop distance = points * point / tickSize * tickValue
+         if(tickValue > 0 && tickSize > 0 && slPoints > 0) lot = riskMoney / (slPoints * _Point / tickSize * tickValue);
          break;
       }
       case Lot_Compound: lot = InpFixedLot * MathPow(InpLotMultiplier, MathMin(currentCount, InpMaxMultiplierSteps)); break;
@@ -383,28 +383,55 @@ double CalculateLotSize(ENUM_POSITION_TYPE posType, int currentCount)
    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double maxLot = MathMin(InpMaxLot, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX));
    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   lot = MathMax(minLot, MathMin(maxLot, lot));
-   lot = MathFloor(lot / lotStep) * lotStep;
-   return NormalizeDouble(lot, 2);
+   if(lotStep <= 0) lotStep = 0.01;
+   if(lot <= 0 || maxLot < minLot) return 0;
+   lot = MathMin(maxLot, lot);
+   //--- Epsilon stops 0.29 / 0.01 = 28.99... from rounding down a whole step
+   lot = MathFloor(lot / lotStep + 1e-9) * lotStep;
+   if(lot < minLot) lot = minLot;
+   int lotDigits = (int)MathMax(0.0, MathCeil(-MathLog10(lotStep) - 1e-9));
+   return NormalizeDouble(lot, lotDigits);
+}
+
+//--- Broker minimum distance between price and a stop, in price units
+double MinStopDistance()
+{
+   return (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
 }
 
 bool OpenTrade(ENUM_ORDER_TYPE orderType, double lot, double tpPoints, double slPoints)
 {
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double minDist = MinStopDistance();
    double price, sl = 0, tp = 0;
    if(orderType == ORDER_TYPE_BUY)
    {
-      price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      if(tpPoints > 0) tp = price + tpPoints * _Point;
-      if(slPoints > 0) sl = price - slPoints * _Point;
+      price = ask;
+      if(tpPoints > 0) tp = MathMax(price + tpPoints * _Point, bid + minDist);
+      if(slPoints > 0) sl = MathMin(price - slPoints * _Point, bid - minDist);
    }
    else
    {
-      price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      if(tpPoints > 0) tp = price - tpPoints * _Point;
-      if(slPoints > 0) sl = price + slPoints * _Point;
+      price = bid;
+      if(tpPoints > 0) tp = MathMin(price - tpPoints * _Point, ask - minDist);
+      if(slPoints > 0) sl = MathMax(price + slPoints * _Point, ask + minDist);
    }
    sl = NormalizeDouble(sl, _Digits);
    tp = NormalizeDouble(tp, _Digits);
+
+   double margin = 0;
+   if(!OrderCalcMargin(orderType, _Symbol, lot, price, margin) || margin > AccountInfoDouble(ACCOUNT_MARGIN_FREE))
+   {
+      static datetime lastWarn = 0;
+      if(TimeCurrent() - lastWarn >= 60)
+      {
+         Print("Skipped entry: not enough free margin for ", DoubleToString(lot, 2), " lots.");
+         lastWarn = TimeCurrent();
+      }
+      return false;
+   }
+
    string comment = InpComment + "_" + IntegerToString(GetTickCount() % 10000);
    if(g_trade.PositionOpen(_Symbol, orderType, lot, price, sl, tp, comment))
    {
@@ -429,7 +456,7 @@ void ManageTrailingStop()
          double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
          if(bid - openPrice > InpTrailingStart * _Point)
          {
-            double newSL = NormalizeDouble(bid - InpTrailingStep * _Point, _Digits);
+            double newSL = NormalizeDouble(bid - MathMax(InpTrailingStep * _Point, MinStopDistance()), _Digits);
             if(newSL > currentSL + _Point) g_trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
          }
       }
@@ -438,7 +465,7 @@ void ManageTrailingStop()
          double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
          if(openPrice - ask > InpTrailingStart * _Point)
          {
-            double newSL = NormalizeDouble(ask + InpTrailingStep * _Point, _Digits);
+            double newSL = NormalizeDouble(ask + MathMax(InpTrailingStep * _Point, MinStopDistance()), _Digits);
             if(newSL < currentSL - _Point || currentSL == 0) g_trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
          }
       }
@@ -456,18 +483,20 @@ void ManageBreakEven()
       ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
       if(posType == POSITION_TYPE_BUY)
       {
-         if(SymbolInfoDouble(_Symbol, SYMBOL_BID) - openPrice >= InpBreakEvenStart * _Point)
+         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         if(bid - openPrice >= InpBreakEvenStart * _Point)
          {
             double newSL = NormalizeDouble(openPrice + InpBreakEvenProfit * _Point, _Digits);
-            if(currentSL < newSL) g_trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
+            if(currentSL < newSL && bid - newSL >= MinStopDistance()) g_trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
          }
       }
       else
       {
-         if(openPrice - SymbolInfoDouble(_Symbol, SYMBOL_ASK) >= InpBreakEvenStart * _Point)
+         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         if(openPrice - ask >= InpBreakEvenStart * _Point)
          {
             double newSL = NormalizeDouble(openPrice - InpBreakEvenProfit * _Point, _Digits);
-            if(currentSL > newSL || currentSL == 0) g_trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
+            if((currentSL > newSL || currentSL == 0) && newSL - ask >= MinStopDistance()) g_trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
          }
       }
    }
@@ -475,43 +504,50 @@ void ManageBreakEven()
 
 void CheckBasketTPSL()
 {
+   if(CountPositionsByType(POSITION_TYPE_BUY) + CountPositionsByType(POSITION_TYPE_SELL) == 0)
+   {
+      g_basketTrailingLevel = 0;
+      return;
+   }
    double totalProfit = GetTotalProfit();
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    if(InpMaxEquityRiskPercent > 0 && balance > 0 && (-totalProfit) >= balance * InpMaxEquityRiskPercent / 100.0)
    {
       CloseAllPositions();
       g_lastBasketCloseTime = TimeCurrent();
+      g_basketTrailingLevel = 0;
       return;
    }
    if(InpUseBasketTP)
    {
+      //--- Once armed, the trail must fire even if profit has slipped back under the basket target
+      if(g_basketTrailingLevel > 0 && totalProfit <= g_basketTrailingLevel)
+      {
+         CloseAllPositions();
+         g_lastBasketCloseTime = TimeCurrent();
+         g_basketTrailingLevel = 0;
+         return;
+      }
       if(totalProfit >= InpBasketTP)
       {
-         if(totalProfit >= InpBasketTrailingStart)
+         if(InpBasketTrailingStep > 0 && totalProfit >= InpBasketTrailingStart)
          {
             double newTrail = totalProfit - InpBasketTrailingStep;
-            if(g_basketTrailingLevel == 0 || newTrail > g_basketTrailingLevel) g_basketTrailingLevel = newTrail;
+            if(newTrail > g_basketTrailingLevel) g_basketTrailingLevel = newTrail;
          }
-         if(g_basketTrailingLevel > 0 && totalProfit <= g_basketTrailingLevel)
-         {
-            CloseAllPositions();
-            g_lastBasketCloseTime = TimeCurrent();
-            g_basketTrailingLevel = 0;
-            return;
-         }
-         if(g_basketTrailingLevel == 0)
+         if(g_basketTrailingLevel <= 0)
          {
             CloseAllPositions();
             g_lastBasketCloseTime = TimeCurrent();
             return;
          }
       }
-      else if(totalProfit < 0) g_basketTrailingLevel = 0;
    }
    if(InpUseBasketSL && totalProfit <= -InpBasketSL)
    {
       CloseAllPositions();
       g_lastBasketCloseTime = TimeCurrent();
+      g_basketTrailingLevel = 0;
    }
 }
 
@@ -570,6 +606,17 @@ bool CheckTradingHours()
    return true;
 }
 
+bool CheckFridayClose()
+{
+   if(!InpCloseOnFriday) return true;
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   if(dt.day_of_week == 5 && dt.hour >= InpFridayCloseHour)
+   {
+      CloseAllPositions(); return false;
+   }
+   return true;
+}
+
 bool CheckDailyLimits()
 {
    MqlDateTime dtNow, dtStart; TimeToStruct(TimeCurrent(), dtNow);
@@ -583,6 +630,8 @@ bool CheckDailyLimits()
       if(HistoryDealGetInteger(ticket, DEAL_MAGIC) == InpMagicNumber && HistoryDealGetString(ticket, DEAL_SYMBOL) == _Symbol)
          dailyPnL += HistoryDealGetDouble(ticket, DEAL_PROFIT) + HistoryDealGetDouble(ticket, DEAL_SWAP) + HistoryDealGetDouble(ticket, DEAL_COMMISSION);
    }
+   //--- Open losses count too, otherwise the limit only triggers after the damage is done
+   dailyPnL += GetTotalProfit();
    if((InpDailyProfitTarget > 0 && dailyPnL >= InpDailyProfitTarget) || (InpDailyLossLimit > 0 && dailyPnL <= -InpDailyLossLimit))
    {
       CloseAllPositions(); return false;
@@ -601,7 +650,7 @@ ENUM_ORDER_TYPE_FILLING GetFillingMode()
 void CreateDashboard()
 {
    int x = 10, y = 30;
-   CreateLabel(g_dashboardName + "_Header", "Grid Scalper MA v2.1", x, y, clrGold, 11);
+   CreateLabel(g_dashboardName + "_Header", "Grid Scalper MA v2.2", x, y, clrGold, 11);
    y += 23;
    CreateLabel(g_dashboardName + "_Buy", "Buys: 0", x, y, clrLime, 9);
    y += 18;
@@ -638,6 +687,7 @@ void DrawGridLines()
 {
    ObjectsDeleteAll(0, "GridLine_");
    double gridStepPrice = GetGridStep() * _Point;
+   if(gridStepPrice <= 0) return;
    double refPrice = GetGridReferencePrice(POSITION_TYPE_BUY);
    double topPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID) + gridStepPrice * 20;
    double botPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID) - gridStepPrice * 20;
