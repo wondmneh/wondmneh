@@ -1,9 +1,8 @@
 //+------------------------------------------------------------------+
 //| GoldDipM1.mq5 - long-only M1 dip buyer with M15 trend filter     |
 //+------------------------------------------------------------------+
-#property version   "1.01"
+#property version   "1.02"
 #property strict
-#include <Trade\Trade.mqh>
 
 input double          InpRiskPercent     = 0.25;       // Risk per trade, % of equity
 input double          InpMaxRiskPercent  = 1.0;        // Max risk % when forced to minimum lot (0 = never use min lot)
@@ -23,7 +22,6 @@ input double          InpDailyLossPct    = 2.0;        // Stop for the day after
 input int             InpMaxTradesPerDay = 20;
 input ulong           InpMagic           = 20261111;
 
-CTrade   trade;
 int      hRSI, hATR, hFast, hSlow;
 datetime g_lastBar = 0;
 int      g_day = -1, g_tradesToday = 0;
@@ -56,8 +54,6 @@ int OnInit()
    if(hRSI == INVALID_HANDLE || hATR == INVALID_HANDLE || hFast == INVALID_HANDLE || hSlow == INVALID_HANDLE)
       return INIT_FAILED;
    ArrayInitialize(g_skip, 0);
-   trade.SetExpertMagicNumber(InpMagic);
-   trade.SetTypeFillingBySymbol(_Symbol);
    return INIT_SUCCEEDED;
 }
 
@@ -123,6 +119,32 @@ double LotForRisk(double slDistance, string &detail)
    return NormalizeDouble(MathMin(lot, maxLot), 2);
 }
 
+// Sends the market buy directly so the EA does not depend on the standard Trade library
+bool SendBuy(double lot, double sl, double tp, uint &retcode, string &retText)
+{
+   MqlTradeRequest req;
+   MqlTradeResult  res;
+   ZeroMemory(req);
+   ZeroMemory(res);
+   long filling = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   req.action       = TRADE_ACTION_DEAL;
+   req.symbol       = _Symbol;
+   req.type         = ORDER_TYPE_BUY;
+   req.volume       = lot;
+   req.price        = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   req.sl           = sl;
+   req.tp           = tp;
+   req.deviation    = 20;
+   req.magic        = InpMagic;
+   req.comment      = "GoldDipM1";
+   req.type_filling = (filling & SYMBOL_FILLING_FOK) != 0 ? ORDER_FILLING_FOK :
+                      (filling & SYMBOL_FILLING_IOC) != 0 ? ORDER_FILLING_IOC : ORDER_FILLING_RETURN;
+   bool sent = OrderSend(req, res);
+   retcode = res.retcode;
+   retText = res.comment;
+   return sent && (res.retcode == TRADE_RETCODE_DONE || res.retcode == TRADE_RETCODE_PLACED);
+}
+
 void OnTick()
 {
    datetime barTime = iTime(_Symbol, PERIOD_M1, 0);
@@ -185,12 +207,14 @@ void OnTick()
 
    double sl = NormalizeDouble(ask - slDist, _Digits);
    double tp = NormalizeDouble(ask + tpDist, _Digits);
-   if(trade.Buy(lot, _Symbol, 0.0, sl, tp, "GoldDipM1"))
+   uint   retcode = 0;
+   string retText = "";
+   if(SendBuy(lot, sl, tp, retcode, retText))
    {
       g_tradesToday++;
       g_orders++;
    }
    else
-      Skip(SK_ORDERFAIL, StringFormat("retcode %u %s", trade.ResultRetcode(), trade.ResultRetcodeDescription()));
+      Skip(SK_ORDERFAIL, StringFormat("retcode %u %s, error %d", retcode, retText, GetLastError()));
 }
 //+------------------------------------------------------------------+
