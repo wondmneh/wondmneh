@@ -1,0 +1,235 @@
+// Based on the "HHLL" (Higher High / Lower Low) setup and the "Free Ride" trade management
+// described in the BATUS Sniper Elite eBook (original author: Mr. Batus, fxpriceline.blogspot.my).
+//
+// BUY  setup: Low (L) -> High (H) -> Lower Low (LL) -> Higher High (HH)
+//             buy limit at L, stop at LL, target #1 at H, target #2 at HH
+// SELL setup: High (H) -> Low (L) -> Higher High (HH) -> Lower Low (LL)
+//             sell limit at H, stop at HH, target #1 at L, target #2 at LL
+//
+//@version=6
+strategy("BATUS Sniper Elite - HHLL", shorttitle="BATUS HHLL", overlay=true, initial_capital=10000, pyramiding=0, margin_long=0, margin_short=0, max_lines_count=500, max_labels_count=500, max_boxes_count=200)
+
+// ───────── Inputs ─────────
+string GRP_SETUP = "Setup"
+int    swingLen     = input.int(5, "Swing length (bars each side)", minval=1, group=GRP_SETUP, tooltip="A swing high/low needs this many lower/higher bars on both sides. Signals appear this many bars after the swing.")
+string dirMode      = input.string("Both", "Trade direction", options=["Both", "Long only", "Short only"], group=GRP_SETUP)
+int    expiryBars   = input.int(100, "Cancel unfilled entry after (bars)", minval=1, group=GRP_SETUP)
+int    stopBufTicks = input.int(0, "Stop buffer beyond LL / HH (ticks)", minval=0, group=GRP_SETUP)
+float  minRiskAtr   = input.float(0.2, "Min stop distance (x ATR 14)", minval=0, step=0.05, group=GRP_SETUP, tooltip="Skips setups whose L-LL / H-HH zone is too thin to trade.")
+float  minRR        = input.float(1.0, "Min reward:risk to final target", minval=0, step=0.1, group=GRP_SETUP)
+
+string GRP_TGT = "Targets"
+string TM_AUTO = "Auto (book rule)"
+string TM_T1   = "Target #1 only"
+string TM_T2   = "Target #2, partial at #1"
+string targetMode = input.string(TM_AUTO, "Target mode", options=[TM_AUTO, TM_T1, TM_T2], group=GRP_TGT, tooltip="Book rule: if targets #1 and #2 are far apart, take a partial at #1 and hold for #2. If they are close, just take #1.")
+float  wideMult   = input.float(1.0, "Targets are 'wide' when #1-#2 distance >= (x risk)", minval=0, step=0.1, group=GRP_TGT)
+float  t1Pct      = input.float(50, "Partial close at target #1 (% of remaining)", minval=1, maxval=99, group=GRP_TGT)
+
+string GRP_FR = "Free Ride"
+string FR_RR   = "1:1 risk:reward"
+string FR_PIPS = "Pips"
+string FR_ANY  = "Whichever comes first"
+bool   useFR   = input.bool(true, "Use Free Ride (partial close + positive stop)", group=GRP_FR)
+string frMode  = input.string(FR_RR, "Trigger", options=[FR_RR, FR_PIPS, FR_ANY], group=GRP_FR)
+float  frPips  = input.float(30, "Trigger pips", minval=1, group=GRP_FR)
+float  frPct   = input.float(50, "Partial close (%)", minval=1, maxval=99, group=GRP_FR)
+float  bePips  = input.float(1, "Move stop to entry + (pips)", minval=0, step=0.5, group=GRP_FR)
+
+string GRP_RISK = "Position size"
+string SZ_RISK  = "Risk % of equity"
+string SZ_FIXED = "Fixed quantity"
+string sizing   = input.string(SZ_RISK, "Sizing", options=[SZ_RISK, SZ_FIXED], group=GRP_RISK)
+float  riskPct  = input.float(1.0, "Risk per trade (%)", minval=0.01, step=0.1, group=GRP_RISK)
+float  fixedQty = input.float(10000, "Fixed quantity (units / contracts)", minval=0, group=GRP_RISK)
+
+string GRP_TIME = "Time filter"
+bool   useBlock  = input.bool(false, "Do not arm new setups during session below", group=GRP_TIME, tooltip="The book advises against trading the Pacific session.")
+string blockSess = input.session("2100-0100", "Blocked session (UTC)", group=GRP_TIME)
+
+string GRP_VIS = "Display"
+bool showZones  = input.bool(true, "Show setup zones, targets and labels", group=GRP_VIS)
+int  extendBars = input.int(30, "Extend drawings to the right (bars)", minval=1, group=GRP_VIS)
+bool useAlerts  = input.bool(true, "Alert when a setup is armed", group=GRP_VIS)
+
+// ───────── Helpers ─────────
+// Forex quotes with 3 or 5 decimals use fractional pips.
+bool  fracPip = syminfo.type == "forex" and (math.abs(syminfo.mintick - 0.00001) < 1e-9 or math.abs(syminfo.mintick - 0.001) < 1e-9)
+float pip     = syminfo.mintick * (fracPip ? 10 : 1)
+
+float atr     = ta.atr(14)
+float ph      = ta.pivothigh(high, swingLen, swingLen)
+float pl      = ta.pivotlow(low, swingLen, swingLen)
+float loSince = ta.lowest(low, swingLen + 1)
+float hiSince = ta.highest(high, swingLen + 1)
+bool  blocked = useBlock and not na(time(timeframe.period, blockSess, "UTC"))
+
+// ───────── Alternating swing list (1 = high, -1 = low) ─────────
+var array<float> swP = array.new<float>()
+var array<int>   swB = array.new<int>()
+var array<int>   swD = array.new<int>()
+
+addSwing(int d, float p, int b) =>
+    bool changed = false
+    int n = swP.size()
+    if n > 0 and swD.last() == d
+        // Same direction as the last swing: keep only the more extreme one.
+        if (d == 1 and p > swP.last()) or (d == -1 and p < swP.last())
+            swP.set(n - 1, p)
+            swB.set(n - 1, b)
+            changed := true
+    else
+        swP.push(p)
+        swB.push(b)
+        swD.push(d)
+        changed := true
+        if swP.size() > 8
+            swP.shift()
+            swB.shift()
+            swD.shift()
+    changed
+
+bool newSwing = false
+if not na(ph)
+    bool c = addSwing(1, ph, bar_index - swingLen)
+    newSwing := newSwing or c
+if not na(pl)
+    bool c = addSwing(-1, pl, bar_index - swingLen)
+    newSwing := newSwing or c
+
+// ───────── Trade state ─────────
+var int   dir        = 0      // 1 long, -1 short, 0 idle
+var bool  pending    = false  // entry order waiting to fill
+var bool  freeRide   = false
+var bool  t1Done     = false
+var bool  usePartial = false
+var int   armBar     = na
+var float eP     = na
+var float sP     = na
+var float t1P    = na
+var float t2P    = na
+var float finalP = na
+var float frP    = na
+var float qTot   = na
+var float qFR    = na
+var float qT1    = na
+
+var array<line>  curLines  = array.new<line>()
+var array<label> curLabels = array.new<label>()
+var box curBox  = na
+var int drawnKey = na
+
+// Read which exits filled since the previous bar.
+int ct     = strategy.closedtrades
+int ctPrev = nz(ct[1])
+if ct > ctPrev
+    for i = ctPrev to ct - 1
+        string xid = strategy.closedtrades.exit_id(i)
+        if xid == "Free Ride"
+            freeRide := true
+        if xid == "Target 1"
+            t1Done := true
+
+if pending and strategy.position_size != 0
+    pending := false
+
+// Trade finished (also covers entry and exit inside the same bar).
+if dir != 0 and strategy.position_size == 0 and ct > ctPrev
+    strategy.cancel_all()
+    dir      := 0
+    pending  := false
+    freeRide := false
+    t1Done   := false
+
+if pending and bar_index - armBar >= expiryBars
+    strategy.cancel_all()
+    dir     := 0
+    pending := false
+
+// ───────── Setup detection ─────────
+if newSwing and swP.size() >= 4 and strategy.position_size == 0 and not blocked
+    int   n  = swP.size()
+    float p0 = swP.get(n - 4)
+    float p1 = swP.get(n - 3)
+    float p2 = swP.get(n - 2)
+    float p3 = swP.get(n - 1)
+    int   d3 = swD.get(n - 1)
+    // Buy:  L(p0) H(p1) LL(p2) HH(p3), price has not come back to L yet.
+    // Sell: H(p0) L(p1) HH(p2) LL(p3), price has not come back to H yet.
+    bool bull = d3 == 1 and p2 < p0 and p3 > p1 and dirMode != "Short only" and loSince > p0
+    bool bear = d3 == -1 and p2 > p0 and p3 < p1 and dirMode != "Long only" and hiSince < p0
+    if bull or bear
+        int   d    = bull ? 1 : -1
+        float stop = p2 - d * stopBufTicks * syminfo.mintick
+        float risk = math.abs(p0 - stop)
+        bool  wide = math.abs(p3 - p1) >= wideMult * risk
+        bool  toT2 = targetMode == TM_T2 or (targetMode == TM_AUTO and wide)
+        float fin  = toT2 ? p3 : p1
+        if risk > 0 and risk >= minRiskAtr * atr and math.abs(fin - p0) / risk >= minRR
+            strategy.cancel_all()
+            dir        := d
+            pending    := true
+            freeRide   := false
+            t1Done     := false
+            usePartial := toT2
+            armBar     := bar_index
+            eP         := p0
+            sP         := stop
+            t1P        := p1
+            t2P        := p3
+            finalP     := fin
+            float frDist = frMode == FR_RR ? risk : frMode == FR_PIPS ? frPips * pip : math.min(risk, frPips * pip)
+            frP  := d == 1 ? math.min(p0 + frDist, fin) : math.max(p0 - frDist, fin)
+            qTot := sizing == SZ_RISK ? strategy.equity * riskPct / 100 / (risk * syminfo.pointvalue) : fixedQty
+            qFR  := useFR ? qTot * frPct / 100 : 0
+            qT1  := toT2 ? (qTot - qFR) * t1Pct / 100 : 0
+
+            if showZones
+                int b0 = swB.get(n - 4)
+                int b1 = swB.get(n - 3)
+                int b2 = swB.get(n - 2)
+                int b3 = swB.get(n - 1)
+                // Same L-LL / H-HH zone re-armed with a more extreme last swing: redraw it.
+                if drawnKey == b2
+                    for ln in curLines
+                        ln.delete()
+                    for lb in curLabels
+                        lb.delete()
+                    curBox.delete()
+                curLines.clear()
+                curLabels.clear()
+                drawnKey := b2
+                color zc = d == 1 ? color.teal : color.red
+                int   x2 = bar_index + extendBars
+                curBox := box.new(b0, math.max(p0, p2), x2, math.min(p0, p2), border_color=color.new(zc, 40), bgcolor=color.new(zc, 85))
+                curLines.push(line.new(b1, p1, x2, p1, color=color.new(color.blue, 0), style=line.style_dashed))
+                curLines.push(line.new(b3, p3, x2, p3, color=color.new(color.blue, 0), style=line.style_dotted))
+                string hiStyle = label.style_label_down
+                string loStyle = label.style_label_up
+                curLabels.push(label.new(b0, p0, d == 1 ? "L" : "H", style=d == 1 ? loStyle : hiStyle, color=zc, textcolor=color.white, size=size.small))
+                curLabels.push(label.new(b1, p1, d == 1 ? "H" : "L", style=d == 1 ? hiStyle : loStyle, color=color.gray, textcolor=color.white, size=size.small))
+                curLabels.push(label.new(b2, p2, d == 1 ? "LL" : "HH", style=d == 1 ? loStyle : hiStyle, color=zc, textcolor=color.white, size=size.small))
+                curLabels.push(label.new(b3, p3, d == 1 ? "HH" : "LL", style=d == 1 ? hiStyle : loStyle, color=color.gray, textcolor=color.white, size=size.small))
+
+            if useAlerts
+                alert((d == 1 ? "HHLL BUY" : "HHLL SELL") + " setup on " + syminfo.ticker + ": entry " + str.tostring(p0, format.mintick) + ", stop " + str.tostring(stop, format.mintick) + ", T1 " + str.tostring(p1, format.mintick) + ", T2 " + str.tostring(p3, format.mintick), alert.freq_once_per_bar_close)
+
+// ───────── Orders ─────────
+// Exits are sent together with the entry so the stop is live on the fill bar.
+float stopNow = na
+if dir != 0
+    string eid = dir == 1 ? "Long" : "Short"
+    stopNow := freeRide and strategy.position_size != 0 ? strategy.position_avg_price + dir * bePips * pip : sP
+    if pending
+        strategy.entry(eid, dir == 1 ? strategy.long : strategy.short, qty=qTot, limit=eP)
+    if useFR and not freeRide and qFR > 0
+        strategy.exit("Free Ride", eid, qty=qFR, limit=frP, stop=stopNow, comment_loss="Stop")
+    if usePartial and not t1Done and qT1 > 0
+        strategy.exit("Target 1", eid, qty=qT1, limit=t1P, stop=stopNow, comment_loss="Stop")
+    strategy.exit("Final", eid, limit=finalP, stop=stopNow, comment_profit=usePartial ? "Target 2" : "Target 1", comment_loss=freeRide ? "Free ride stop" : "Stop")
+
+// ───────── Plots ─────────
+plot(dir != 0 ? eP : na, "Entry", color=color.blue, style=plot.style_linebr)
+plot(stopNow, "Stop", color=color.red, style=plot.style_linebr)
+plot(dir != 0 ? finalP : na, "Final target", color=color.green, style=plot.style_linebr)
+plot(dir != 0 and useFR and not freeRide ? frP : na, "Free Ride trigger", color=color.orange, style=plot.style_linebr)
