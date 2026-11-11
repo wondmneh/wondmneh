@@ -1,0 +1,396 @@
+//@version=6
+// Institutional Playbook - rule-based version of the cheat sheet's trade process:
+//   context (HTF bias) -> liquidity -> setup -> entry -> risk -> target -> manage
+// Setups:
+//   A. Liquidity sweep / SFP -> market structure shift -> fair value gap entry
+//   B. Break of structure -> retest of the broken level or of the order block
+//   C. Quasimodo (QM) -> retest of the QM level
+// Liquidity used for sweeps and targets: swing highs/lows (incl. equal highs/lows),
+// previous day and week high/low, Asia session range.
+strategy("Institutional Playbook", "IPB", overlay = true, initial_capital = 10000, pyramiding = 0,
+     margin_long = 0, margin_short = 0, max_bars_back = 500)
+
+//--- Inputs
+string G1 = "1. Context (HTF bias)"
+bool   useBias    = input.bool(true, "Trade only with higher-timeframe bias", group = G1)
+string biasTf     = input.timeframe("240", "Bias timeframe", group = G1)
+int    biasSwing  = input.int(3, "Bias swing strength", minval = 1, group = G1)
+bool   usePD      = input.bool(false, "Longs only in discount, shorts only in premium", group = G1)
+
+string G2 = "2. Liquidity"
+int    swingLen   = input.int(3, "Swing strength", minval = 1, group = G2)
+int    maxLevels  = input.int(20, "Swing levels to track per side", minval = 2, group = G2)
+bool   usePrev    = input.bool(true, "Previous day/week high and low", group = G2)
+bool   useAsia    = input.bool(true, "Asia session high and low (intraday only)", group = G2)
+string asiaSess   = input.session("0000-0600", "Asia session", group = G2)
+string sessTz     = input.string("UTC", "Session time zone", group = G2)
+
+string G3 = "3-4. Setups & Entry"
+bool   useA       = input.bool(true, "A. Sweep -> structure shift -> FVG", group = G3)
+int    setupBars  = input.int(12, "A: bars allowed from sweep to structure shift", minval = 1, group = G3)
+string aEntryMode = input.string("FVG limit", "A: entry", options = ["FVG limit", "Market"], group = G3)
+float  fvgFill    = input.float(0.5, "A: entry depth into the FVG (0=edge, 1=full)", minval = 0, maxval = 1, step = 0.1, group = G3)
+bool   useB       = input.bool(true, "B. Break of structure -> retest", group = G3)
+string bEntryMode = input.string("Order block", "B: entry", options = ["Order block", "Broken level"], group = G3)
+int    obLookback = input.int(10, "B: bars to search for the order block", minval = 1, group = G3)
+bool   useC       = input.bool(true, "C. Quasimodo retest", group = G3)
+int    orderBars  = input.int(10, "Cancel unfilled limit after N bars", minval = 1, group = G3)
+
+string G5 = "5-6. Risk & Target"
+float  riskPct    = input.float(0.5, "Risk per trade, % of equity (0 = fixed size)", minval = 0, step = 0.1, group = G5)
+float  fixedQty   = input.float(1, "Fixed size when risk % is 0", minval = 0, group = G5)
+int    atrLen     = input.int(14, "ATR period", minval = 1, group = G5)
+float  slBuf      = input.float(0.1, "Stop buffer (x ATR)", minval = 0, step = 0.05, group = G5)
+float  minRR      = input.float(2.0, "Minimum reward:risk", minval = 0.1, step = 0.25, group = G5)
+bool   useLiqTgt  = input.bool(true, "Target the next opposing liquidity", group = G5)
+float  fixedRR    = input.float(3.0, "Reward:risk when no liquidity target", minval = 0.1, step = 0.25, group = G5)
+
+string G7 = "7. Management"
+float  beR        = input.float(1.0, "Move stop to entry at this R (0 = off)", minval = 0, step = 0.25, group = G7)
+float  partialPct = input.float(50, "% of position closed at that point (0 = off)", minval = 0, maxval = 99, group = G7)
+int    beOffset   = input.int(0, "Break-even offset in ticks", minval = 0, group = G7)
+
+string G8 = "Limits & Filters"
+int    maxTrades  = input.int(2, "Max trades per day (0 = off)", minval = 0, group = G8)
+float  dayLossPct = input.float(2.0, "Stop for the day at this loss % (0 = off)", minval = 0, step = 0.5, group = G8)
+bool   useSess    = input.bool(false, "Restrict trading hours", group = G8)
+string tradeSess  = input.session("0700-2000", "Trading hours", group = G8)
+bool   showInfo   = input.bool(true, "Show status table", group = G8)
+
+//--- Helpers
+f_structure(int len) =>
+    float ph = ta.pivothigh(high, len, len)
+    float pl = ta.pivotlow(low, len, len)
+    var float sh0 = na
+    var float sh1 = na
+    var float sl0 = na
+    var float sl1 = na
+    if not na(ph)
+        sh1 := sh0
+        sh0 := ph
+    if not na(pl)
+        sl1 := sl0
+        sl0 := pl
+    int b = sh0 > sh1 and sl0 > sl1 ? 1 : sh0 < sh1 and sl0 < sl1 ? -1 : 0
+    [b, (sh0 + sl0) / 2]
+
+// Previous completed HTF bar, so the bias never repaints
+f_structurePrev(int len) =>
+    [b, e] = f_structure(len)
+    [b[1], e[1]]
+
+// dir 1 = sell-side level swept (long setup), -1 = buy-side level swept (short setup)
+f_isSweep(float lvl, int dir) =>
+    not na(lvl) and (dir > 0 ? low < lvl and close > lvl : high > lvl and close < lvl)
+
+f_anySwept(array<float> levels, int dir) =>
+    bool res = false
+    for lvl in levels
+        if f_isSweep(lvl, dir)
+            res := true
+    res
+
+f_purge(array<float> levels, int dir) =>
+    int removed = 0
+    if levels.size() > 0
+        for i = levels.size() - 1 to 0
+            float lvl = levels.get(i)
+            if dir > 0 ? low < lvl : high > lvl
+                levels.remove(i)
+                removed += 1
+    removed
+
+// Newest swing on the far side of the close
+f_firstBeyond(array<float> levels, int dir) =>
+    float res = na
+    for lvl in levels
+        if na(res) and (dir > 0 ? lvl > close : lvl < close)
+            res := lvl
+    res
+
+f_pick(float best, float p, int dir, float minT) =>
+    bool ok = not na(p) and (dir > 0 ? p >= minT : p <= minT)
+    ok and (na(best) or (dir > 0 ? p < best : p > best)) ? p : best
+
+// Nearest opposing liquidity that pays at least the minimum reward:risk
+f_target(array<float> levels, int dir, float minT, float n1, float n2, float n3) =>
+    float best = na
+    for p in levels
+        best := f_pick(best, p, dir, minT)
+    best := f_pick(best, n1, dir, minT)
+    best := f_pick(best, n2, dir, minT)
+    best := f_pick(best, n3, dir, minT)
+    best
+
+//--- 1. Context
+float atr = ta.atr(atrLen)
+[htfBias, htfEq] = request.security(syminfo.tickerid, biasTf, f_structurePrev(biasSwing), lookahead = barmerge.lookahead_on)
+bool biasLong  = not useBias or htfBias == 1
+bool biasShort = not useBias or htfBias == -1
+bool pdLong    = not usePD or close < htfEq
+bool pdShort   = not usePD or close > htfEq
+
+//--- 2. Liquidity
+[pdh0, pdl0] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+[pwh0, pwl0] = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+float pdh = usePrev ? pdh0 : na
+float pdl = usePrev ? pdl0 : na
+float pwh = usePrev ? pwh0 : na
+float pwl = usePrev ? pwl0 : na
+
+bool inAsia = not na(time(timeframe.period, asiaSess, sessTz))
+var float curHi  = na
+var float curLo  = na
+var float asiaHi = na
+var float asiaLo = na
+if inAsia
+    curHi := inAsia[1] ? math.max(curHi, high) : high
+    curLo := inAsia[1] ? math.min(curLo, low) : low
+else if inAsia[1]
+    asiaHi := curHi
+    asiaLo := curLo
+bool  asiaOn = useAsia and timeframe.isintraday and not inAsia
+float aHi = asiaOn ? asiaHi : na
+float aLo = asiaOn ? asiaLo : na
+
+var array<float> bsl = array.new<float>()          // untaken swing highs
+var array<float> ssl = array.new<float>()          // untaken swing lows
+var array<float> recentHighs = array.new<float>()  // newest first
+var array<float> recentLows  = array.new<float>()
+
+bool longSweep  = f_anySwept(ssl, 1) or f_isSweep(pdl, 1) or f_isSweep(pwl, 1) or f_isSweep(aLo, 1)
+bool shortSweep = f_anySwept(bsl, -1) or f_isSweep(pdh, -1) or f_isSweep(pwh, -1) or f_isSweep(aHi, -1)
+f_purge(ssl, 1)
+f_purge(bsl, -1)
+
+// Swing tracking: h0/l0 newest, h1/l1 previous, with the opposite swing that sits between them
+float ph = ta.pivothigh(high, swingLen, swingLen)
+float pl = ta.pivotlow(low, swingLen, swingLen)
+var float h0 = na
+var float h1 = na
+var float l0 = na
+var float l1 = na
+var int   h0b = na
+var int   h1b = na
+var int   l0b = na
+var int   l1b = na
+var float lBetween = na
+var float hBetween = na
+var bool  h0Broken = false
+var bool  l0Broken = false
+if not na(ph)
+    h1  := h0
+    h1b := h0b
+    h0  := ph
+    h0b := bar_index - swingLen
+    lBetween := not na(l0b) and not na(h1b) and l0b > h1b ? l0 : na
+    h0Broken := false
+    bsl.push(ph)
+    recentHighs.unshift(ph)
+    if bsl.size() > maxLevels
+        bsl.shift()
+    if recentHighs.size() > maxLevels
+        recentHighs.pop()
+if not na(pl)
+    l1  := l0
+    l1b := l0b
+    l0  := pl
+    l0b := bar_index - swingLen
+    hBetween := not na(h0b) and not na(l1b) and h0b > l1b ? h0 : na
+    l0Broken := false
+    ssl.push(pl)
+    recentLows.unshift(pl)
+    if ssl.size() > maxLevels
+        ssl.shift()
+    if recentLows.size() > maxLevels
+        recentLows.pop()
+
+//--- Trade state
+var bool  pending  = false
+var int   orderBar = na
+var int   tDir     = 0
+var float tSL      = na
+var float tTP      = na
+var float tBE      = na
+var float tQty     = na
+var bool  beDone   = false
+var int   dayTrades = 0
+var float dayEq     = strategy.initial_capital
+
+if timeframe.change("D")
+    dayTrades := 0
+    dayEq     := strategy.equity
+if strategy.position_size != 0 and strategy.position_size[1] == 0
+    dayTrades += 1
+if strategy.position_size != 0 or strategy.closedtrades != strategy.closedtrades[1]
+    pending := false
+
+bool sessOk   = not useSess or not na(time(timeframe.period, tradeSess, sessTz))
+bool dayOk    = (maxTrades == 0 or dayTrades < maxTrades) and (dayLossPct == 0 or strategy.equity > dayEq * (1 - dayLossPct / 100))
+bool flat     = strategy.position_size == 0 and not pending
+bool canTrade = flat and sessOk and dayOk
+
+//--- Signal chosen this bar
+int    sig       = 0
+float  sigEntry  = na
+float  sigStop   = na
+string sigName   = ""
+bool   sigMarket = false
+
+//--- Setup A: sweep -> structure shift -> FVG
+var int   sDir = 0
+var float sExt = na
+var float sMss = na
+var int   sBar = na
+if sDir != 0
+    if (sDir > 0 and not biasLong) or (sDir < 0 and not biasShort)
+        sDir := 0
+    else
+        sExt := sDir > 0 ? math.min(sExt, low) : math.max(sExt, high)
+        if sDir > 0 ? close > sMss : close < sMss
+            float near = na
+            float far  = na
+            int   last = math.min(bar_index - sBar - 1, setupBars)
+            if last >= 0
+                for k = 0 to last
+                    if na(near)
+                        if sDir > 0 and low[k] > high[k + 2]
+                            near := low[k]
+                            far  := high[k + 2]
+                        else if sDir < 0 and high[k] < low[k + 2]
+                            near := high[k]
+                            far  := low[k + 2]
+            if aEntryMode == "Market" or not na(near)
+                sig       := sDir
+                sigMarket := aEntryMode == "Market"
+                sigEntry  := sigMarket ? close : near + (far - near) * fvgFill
+                sigStop   := sExt - sDir * atr * slBuf
+                sigName   := sDir > 0 ? "Sweep long" : "Sweep short"
+            sDir := 0
+        else if bar_index - sBar >= setupBars
+            sDir := 0
+else if useA and canTrade
+    int d = longSweep and biasLong and pdLong ? 1 : shortSweep and biasShort and pdShort ? -1 : 0
+    if d != 0
+        float m = f_firstBeyond(d > 0 ? recentHighs : recentLows, d)
+        if not na(m)
+            sDir := d
+            sExt := d > 0 ? low : high
+            sMss := m
+            sBar := bar_index
+
+//--- Setup C: Quasimodo. Higher high then a close under the low between the two highs
+//    (mirrored for longs); entry on the retest of the first high / first low.
+var int qmUsed = -1
+bool qmBear = useC and not na(lBetween) and h0 > h1 and not h0Broken and close < lBetween and close[1] >= lBetween and qmUsed != h0b
+bool qmBull = useC and not na(hBetween) and l0 < l1 and not l0Broken and close > hBetween and close[1] <= hBetween and qmUsed != l0b
+if sig == 0 and qmBear and biasShort
+    sig      := -1
+    sigEntry := h1
+    sigStop  := h0 + atr * slBuf
+    sigName  := "QM short"
+    qmUsed   := h0b
+else if sig == 0 and qmBull and biasLong
+    sig      := 1
+    sigEntry := l1
+    sigStop  := l0 - atr * slBuf
+    sigName  := "QM long"
+    qmUsed   := l0b
+
+//--- Setup B: break of structure -> retest
+bool bosUp   = not na(h0) and not h0Broken and close > h0
+bool bosDown = not na(l0) and not l0Broken and close < l0
+if sig == 0 and useB and ((bosUp and biasLong) or (bosDown and biasShort))
+    int   d      = bosUp and biasLong ? 1 : -1
+    float bEntry = d > 0 ? h0 : l0
+    float bStop  = d > 0 ? l0 : h0
+    if bEntryMode == "Order block"
+        // Last opposite candle before the break
+        bEntry := na
+        for k = 1 to obLookback
+            if na(bEntry) and (d > 0 ? close[k] < open[k] : close[k] > open[k])
+                bEntry := d > 0 ? high[k] : low[k]
+                bStop  := d > 0 ? low[k] : high[k]
+    if not na(bEntry) and not na(bStop) and (d > 0 ? bEntry < close : bEntry > close)
+        sig      := d
+        sigEntry := bEntry
+        sigStop  := bStop - d * atr * slBuf
+        sigName  := d > 0 ? "BOS long" : "BOS short"
+if bosUp
+    h0Broken := true
+if bosDown
+    l0Broken := true
+
+//--- 4-6. Entry, risk, target
+if sig != 0 and canTrade
+    bool  isMarket = sigMarket or (sig > 0 ? close <= sigEntry : close >= sigEntry)
+    float e    = isMarket ? close : math.round_to_mintick(sigEntry)
+    float stop = math.round_to_mintick(sigStop)
+    float risk = (e - stop) * sig
+    if risk > syminfo.mintick
+        float minT = e + sig * minRR * risk
+        float t = na
+        if useLiqTgt
+            t := sig > 0 ? f_target(bsl, 1, minT, pdh, pwh, aHi) : f_target(ssl, -1, minT, pdl, pwl, aLo)
+        if na(t)
+            t := e + sig * math.max(fixedRR, minRR) * risk
+        float q = riskPct > 0 ? strategy.equity * riskPct / 100 / (risk * syminfo.pointvalue) : fixedQty
+        if q > 0
+            tDir     := sig
+            tSL      := stop
+            tTP      := math.round_to_mintick(t)
+            tBE      := math.round_to_mintick(e + sig * beR * risk)
+            tQty     := q
+            beDone   := false
+            pending  := true
+            orderBar := bar_index
+            if isMarket
+                strategy.entry("IPB", sig > 0 ? strategy.long : strategy.short, qty = q, comment = sigName)
+            else
+                strategy.entry("IPB", sig > 0 ? strategy.long : strategy.short, qty = q, limit = e, comment = sigName)
+
+//--- 7. Management
+// Unfilled limit: cancel when it is too old or price reached the stop first
+if pending and strategy.position_size == 0 and bar_index > orderBar
+    if bar_index - orderBar >= orderBars or (tDir > 0 ? low <= tSL : high >= tSL)
+        strategy.cancel("IPB")
+        strategy.cancel("TP1")
+        strategy.cancel("Exit")
+        pending := false
+
+bool usePartial = partialPct > 0 and beR > 0
+bool reduced    = strategy.position_size != 0 and math.abs(strategy.position_size) < tQty * 0.999
+if strategy.position_size != 0 and beR > 0 and not beDone
+    bool reached = strategy.opentrades.entry_bar_index(0) < bar_index and (tDir > 0 ? high >= tBE : low <= tBE)
+    if reduced or reached
+        tSL    := math.round_to_mintick(strategy.position_avg_price + tDir * beOffset * syminfo.mintick)
+        beDone := true
+
+if pending or strategy.position_size != 0
+    if usePartial and not beDone and not reduced
+        strategy.exit("TP1", "IPB", qty_percent = partialPct, limit = tBE, stop = tSL, comment = "Partial")
+    strategy.exit("Exit", "IPB", limit = tTP, stop = tSL)
+
+//--- Visuals
+bool live = pending or strategy.position_size != 0
+bgcolor(useBias and htfBias == 1 ? color.new(color.green, 93) : useBias and htfBias == -1 ? color.new(color.red, 93) : na)
+plot(live ? tSL : na, "Stop", color.red, style = plot.style_linebr)
+plot(live ? tTP : na, "Target", color.green, style = plot.style_linebr)
+plot(pdh, "Previous day high", color.new(color.blue, 50), style = plot.style_stepline)
+plot(pdl, "Previous day low", color.new(color.blue, 50), style = plot.style_stepline)
+plot(aHi, "Asia high", color.new(color.orange, 50), style = plot.style_linebr)
+plot(aLo, "Asia low", color.new(color.orange, 50), style = plot.style_linebr)
+plotshape(longSweep, "Sell-side sweep", shape.triangleup, location.belowbar, color.new(color.green, 30), size = size.tiny)
+plotshape(shortSweep, "Buy-side sweep", shape.triangledown, location.abovebar, color.new(color.red, 30), size = size.tiny)
+
+var table info = table.new(position.top_right, 2, 3, bgcolor = color.new(color.black, 70), border_width = 1)
+if showInfo and barstate.islast
+    string biasTxt  = not useBias ? "Off" : htfBias == 1 ? "Bullish" : htfBias == -1 ? "Bearish" : "Neutral (no trades)"
+    string setupTxt = sDir > 0 ? "Sweep long, waiting for shift" : sDir < 0 ? "Sweep short, waiting for shift" : pending ? "Limit order waiting" : "None"
+    string gateTxt  = not dayOk ? "Daily limit reached" : not sessOk ? "Outside trading hours" : "Open"
+    info.cell(0, 0, "Bias", text_color = color.white, text_size = size.small)
+    info.cell(1, 0, biasTxt, text_color = color.white, text_size = size.small)
+    info.cell(0, 1, "Setup", text_color = color.white, text_size = size.small)
+    info.cell(1, 1, setupTxt, text_color = color.white, text_size = size.small)
+    info.cell(0, 2, "Trading", text_color = color.white, text_size = size.small)
+    info.cell(1, 2, gateTxt, text_color = color.white, text_size = size.small)
