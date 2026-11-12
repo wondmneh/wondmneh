@@ -1,0 +1,388 @@
+//@version=6
+// The Setup Playbook: 4H direction and boxes, 30m pullback, 5m structure shift, session VWAP target.
+//
+// The playbook's tape check (step 3c) cannot be read from TradingView bars, so it is replaced by a
+// volume check on or around the sweep bar. ABSORPTION = heavy volume on a bar that probed a new
+// extreme yet closed back in the other half of its range (a lot of effort, no result).
+//
+// Read before trading it: a bar-by-bar re-implementation of these rules on Binance BTC and gold
+// futures (2020-2026, 0.05% per side) did not make money. The strict rules trigger about once a
+// year on BTC, and loosening them produces more trades that lose about 0.4R each after fees.
+// Use it to study the setup and as a checklist, not as an income strategy. Not financial advice.
+strategy("The Setup Playbook", "Setup Playbook", overlay = true, initial_capital = 10000,
+     commission_type = strategy.commission.percent, commission_value = 0.05,
+     process_orders_on_close = true, pyramiding = 0, margin_long = 10, margin_short = 10,
+     max_boxes_count = 300, max_labels_count = 300, max_bars_back = 500)
+
+const string G1 = "Step 1 · Direction and boxes (trend timeframe)"
+const string G2 = "Step 2 · Pullback"
+const string G3 = "Step 3 · Trigger and confirmation (chart timeframe)"
+const string G4 = "Step 4 · The trade"
+const string G5 = "Step 5 · Exits and filters"
+const string G6 = "Display"
+
+string trendTf     = input.timeframe("240", "Trend timeframe", group = G1)
+int    swingLen    = input.int(3, "Swing length", minval = 1, group = G1, tooltip = "Bars on each side of a swing. Higher highs and higher lows: buy only. Lower highs and lower lows: sell only. Anything else: no trade.")
+float  impulseMult = input.float(1.5, "Strong move: candle body ≥ × ATR", minval = 0.5, step = 0.1, group = G1)
+float  baseMult    = input.float(0.5, "Base: candle bodies ≤ × ATR", minval = 0.1, step = 0.05, group = G1, tooltip = "The box is drawn around the small candles right before the strong move.")
+int    maxBase     = input.int(4, "Base: max candles", minval = 1, maxval = 10, group = G1)
+int    maxZones    = input.int(3, "Boxes kept per side", minval = 1, maxval = 10, group = G1)
+
+string pbTf        = input.timeframe("30", "Pullback timeframe", group = G2)
+int    pbLen       = input.int(2, "Swing length", minval = 1, group = G2)
+bool   needPb      = input.bool(true, "Require lower highs into demand / higher lows into supply", group = G2)
+float  killMult    = input.float(0.25, "Box is dead after a close through it by × ATR", minval = 0, step = 0.05, group = G2)
+
+int    trigLen     = input.int(2, "Swing length for the last lower high", minval = 1, maxval = 20, group = G3)
+bool   needInside  = input.bool(true, "Shift candle must close inside the box", group = G3)
+bool   needSweep   = input.bool(false, "Require a poke beyond the box first (the sweep)", group = G3)
+string confMode    = input.string("Absorption", "Confirmation (replaces the tape check)", options = ["Absorption", "Absorption or exhaustion", "RSI divergence", "Any of them", "Off"], group = G3, tooltip = "Absorption: heavy volume on a bar that made a new extreme but closed back in the other half of its range. Exhaustion: the sweep bar printed on thin volume. RSI divergence: new price extreme, weaker RSI.")
+float  absMult     = input.float(1.5, "Absorption: volume ≥ × 20-bar average", minval = 1, step = 0.1, group = G3)
+float  exhMult     = input.float(0.7, "Exhaustion: sweep-bar volume ≤ × average", minval = 0.1, step = 0.05, group = G3)
+int    lookAround  = input.int(1, "Bars either side of the sweep bar to check", minval = 0, maxval = 5, group = G3)
+
+float  stopBuf     = input.float(0.1, "Stop beyond the sweep by × ATR", minval = 0, step = 0.05, group = G4)
+float  minRR       = input.float(1.5, "VWAP at least × risk away", minval = 0, step = 0.1, group = G4)
+float  maxRR       = input.float(4.0, "VWAP at most × risk away", minval = 0.5, step = 0.5, group = G4)
+float  minStopPct  = input.float(0.0, "Skip stops tighter than % of price", minval = 0, step = 0.05, group = G4, tooltip = "Fees are charged on the whole position, so a very tight stop makes them large next to the amount risked. 0 = off.")
+float  riskPct     = input.float(1.0, "Risk per trade, % of equity", minval = 0.05, step = 0.25, group = G4)
+float  maxLev      = input.float(5.0, "Max position size, × equity", minval = 0.1, step = 0.5, group = G4, tooltip = "Caps the position when the stop is very tight. Above 10, also raise the leverage in the Properties tab.")
+
+int    stallBars   = input.int(35, "Stall exit: bars without progress to VWAP (0 = off)", minval = 0, group = G5)
+bool   liveTarget  = input.bool(true, "Target follows the live VWAP", group = G5, tooltip = "Off: the target stays at the VWAP level seen at entry.")
+string dirMode     = input.string("Both", "Direction", options = ["Both", "Long only", "Short only"], group = G5)
+bool   skipWeekend = input.bool(false, "No entries on Saturday or Sunday", group = G5)
+
+bool   showZones   = input.bool(true, "Boxes", group = G6)
+bool   showRejects = input.bool(true, "Mark rejected setups", group = G6, tooltip = "Labels a structure shift that followed a tag of a box but failed the checklist, with the checks it failed.")
+bool   showPanel   = input.bool(true, "Checklist panel", group = G6)
+
+const int   ATR_LEN    = 14
+const int   RSI_LEN    = 14
+const int   VOL_LEN    = 20
+const color DEMAND_COL = color.teal
+const color SUPPLY_COL = color.maroon
+
+if barstate.isfirst and (timeframe.in_seconds(pbTf) <= timeframe.in_seconds() or timeframe.in_seconds(trendTf) <= timeframe.in_seconds(pbTf))
+    runtime.error("Chart timeframe must be below the pullback timeframe, and that below the trend timeframe (playbook: 5m chart, 30m, 4H).")
+
+type Zone
+    float top
+    float bot
+    int   born
+    box   bx
+
+type Swing
+    float price = na
+    float rsi = na
+    int   bar = na
+
+// One side of the 5m structure. For longs: `level` is the last lower high, `ext` the sweep low under it.
+type Leg
+    float level = na
+    bool  broken = true
+    float ext = na
+    int   extBar = na
+    float extVol = na
+    bool  extDiv = false
+
+type Trade
+    float stop = na
+    float target = na
+    float sweep = na
+    float best = na
+    int   bestBar = na
+    int   sess = na
+
+// ───────── Higher timeframes. Every value is taken from the last closed bar, so nothing repaints.
+f_swings(int len) =>
+    float ph = ta.pivothigh(high, len, len)
+    float pl = ta.pivotlow(low, len, len)
+    var float h1 = na
+    var float h2 = na
+    var float l1 = na
+    var float l2 = na
+    if not na(ph)
+        h2 := h1
+        h1 := ph
+    if not na(pl)
+        l2 := l1
+        l1 := pl
+    [h1, h2, l1, l2]
+
+// The small candles right before a strong candle that closes beyond them.
+f_base(int dir, float atrRef) =>
+    float top = na
+    float bot = na
+    int n = 0
+    bool found = false
+    if (close - open) * dir >= impulseMult * atrRef
+        for k = 1 to maxBase
+            if math.abs(close[k] - open[k]) > baseMult * atrRef
+                break
+            n += 1
+            top := na(top) ? high[k] : math.max(top, high[k])
+            bot := na(bot) ? low[k] : math.min(bot, low[k])
+        if n > 0
+            found := dir == 1 ? close > top : close < bot
+    [found, top, bot, n]
+
+f_trendTf() =>
+    [h1, h2, l1, l2] = f_swings(swingLen)
+    int dir = h1 > h2 and l1 > l2 ? 1 : h1 < h2 and l1 < l2 ? -1 : 0
+    float atrRef = ta.atr(ATR_LEN)[1]
+    [dFound, dT, dB, dN] = f_base(1, atrRef)
+    [sFound, sT, sB, sN] = f_base(-1, atrRef)
+    var float dTop = na
+    var float dBot = na
+    var int dLeft = na
+    var int dId = na
+    var float sTop = na
+    var float sBot = na
+    var int sLeft = na
+    var int sId = na
+    if dFound
+        dTop := dT
+        dBot := dB
+        dLeft := time[dN]
+        dId := time
+    if sFound
+        sTop := sT
+        sBot := sB
+        sLeft := time[sN]
+        sId := time
+    [dir[1], dTop[1], dBot[1], dLeft[1], dId[1], sTop[1], sBot[1], sLeft[1], sId[1]]
+
+f_pullbackTf() =>
+    [h1, h2, l1, l2] = f_swings(pbLen)
+    bool lowerHighs = h1 < h2
+    bool higherLows = l1 > l2
+    float a = ta.atr(ATR_LEN)
+    [lowerHighs[1], higherLows[1], close[1], a[1]]
+
+[trendDir, dTop, dBot, dLeft, dId, sTop, sBot, sLeft, sId] = request.security(syminfo.tickerid, trendTf, f_trendTf(), lookahead = barmerge.lookahead_on)
+[pbLowerHighs, pbHigherLows, pbClose, pbAtr] = request.security(syminfo.tickerid, pbTf, f_pullbackTf(), lookahead = barmerge.lookahead_on)
+
+// ───────── Chart timeframe
+float atr5     = ta.atr(ATR_LEN)
+float rsi5     = ta.rsi(close, RSI_LEN)
+float volAvg   = ta.sma(volume, VOL_LEN)
+float relVol   = volAvg > 0 ? volume / volAvg : na
+float rng      = high - low
+float closePos = rng > 0 ? (close - low) / rng : na
+bool  newDay   = timeframe.change("1D")
+float vwapNow  = ta.vwap(hlc3, newDay)
+var int sessId = 0
+if newDay
+    sessId += 1
+
+bool absorbLong  = low < low[1] and relVol >= absMult and closePos >= 0.5
+bool absorbShort = high > high[1] and relVol >= absMult and closePos <= 0.5
+
+float pivotHigh = ta.pivothigh(high, trigLen, trigLen)
+float pivotLow  = ta.pivotlow(low, trigLen, trigLen)
+var Swing swingLow1 = Swing.new()
+var Swing swingLow2 = Swing.new()
+var Swing swingHigh1 = Swing.new()
+var Swing swingHigh2 = Swing.new()
+if not na(pivotLow)
+    swingLow2 := swingLow1
+    swingLow1 := Swing.new(pivotLow, rsi5[trigLen], bar_index - trigLen)
+if not na(pivotHigh)
+    swingHigh2 := swingHigh1
+    swingHigh1 := Swing.new(pivotHigh, rsi5[trigLen], bar_index - trigLen)
+
+// Tracks the move against `dir` and returns true on the candle that closes through its last swing.
+f_trackLeg(Leg g, int dir, float pivot, Swing ref1, Swing ref2) =>
+    int off = -1
+    if not na(pivot)
+        g.level := pivot
+        g.broken := false
+        off := trigLen
+        float e = dir == 1 ? low[trigLen] : high[trigLen]
+        for k = trigLen - 1 to 0
+            float p = dir == 1 ? low[k] : high[k]
+            if dir == 1 ? p < e : p > e
+                e := p
+                off := k
+        g.ext := e
+    else if dir == 1 ? low < g.ext : high > g.ext
+        g.ext := dir == 1 ? low : high
+        off := 0
+    if off >= 0
+        g.extBar := bar_index - off
+        g.extVol := relVol[off]
+        // Compare with the previous swing extreme, never with the bar itself.
+        Swing ref = ref1.bar == g.extBar ? ref2 : ref1
+        float r = rsi5[off]
+        g.extDiv := not na(ref.rsi) and (dir == 1 ? g.ext < ref.price and r > ref.rsi : g.ext > ref.price and r < ref.rsi)
+    bool shift = not g.broken and (dir == 1 ? close > g.level : close < g.level)
+    if shift
+        g.broken := true
+    shift
+
+var Leg downLeg = Leg.new()
+var Leg upLeg = Leg.new()
+bool shiftUp = f_trackLeg(downLeg, 1, pivotHigh, swingLow1, swingLow2)
+bool shiftDn = f_trackLeg(upLeg, -1, pivotLow, swingHigh1, swingHigh2)
+
+// ───────── Open trade (step 5)
+var Trade trade = Trade.new()
+if strategy.position_size != 0
+    bool isLong = strategy.position_size > 0
+    string id = isLong ? "Long" : "Short"
+    if isLong ? close < trade.sweep : close > trade.sweep
+        strategy.close(id, comment = "Closed beyond sweep")
+    else
+        if isLong ? high > trade.best : low < trade.best
+            trade.best := isLong ? high : low
+            trade.bestBar := bar_index
+        if stallBars > 0 and bar_index - trade.bestBar >= stallBars
+            strategy.close(id, comment = "Stalled")
+        else
+            // The target only trails within the session it was taken in; a new session resets VWAP.
+            if liveTarget and sessId == trade.sess and not na(vwapNow)
+                trade.target := vwapNow
+            strategy.exit(id + " exit", id, stop = trade.stop, limit = trade.target, comment_loss = "Stop", comment_profit = "VWAP")
+
+// ───────── Boxes (steps 1 and 2)
+f_retire(Zone z, color col) =>
+    if not na(z.bx)
+        z.bx.set_right(time)
+        z.bx.set_bgcolor(color.new(col, 93))
+        z.bx.set_border_color(color.new(col, 70))
+
+f_addZone(array<Zone> zones, float top, float bot, int left, color col) =>
+    box b = showZones ? box.new(left, top, time, bot, xloc = xloc.bar_time, border_color = color.new(col, 30), bgcolor = color.new(col, 85)) : na
+    zones.push(Zone.new(top, bot, bar_index, b))
+    if zones.size() > maxZones
+        f_retire(zones.shift(), color.gray)
+
+f_maintain(array<Zone> zones, int dir) =>
+    int i = zones.size() - 1
+    while i >= 0
+        Zone z = zones.get(i)
+        if dir == 1 ? pbClose < z.bot - killMult * pbAtr : pbClose > z.top + killMult * pbAtr
+            f_retire(zones.remove(i), color.gray)
+        else if not na(z.bx)
+            z.bx.set_right(time)
+        i -= 1
+
+var array<Zone> demandZones = array.new<Zone>()
+var array<Zone> supplyZones = array.new<Zone>()
+var int firstBarTime = time
+var int lastDemandId = na
+var int lastSupplyId = na
+// Boxes older than the chart's history are skipped: their earlier visits cannot be known.
+if not na(dId) and dId >= firstBarTime and (na(lastDemandId) or dId != lastDemandId)
+    lastDemandId := dId
+    f_addZone(demandZones, dTop, dBot, dLeft, DEMAND_COL)
+if not na(sId) and sId >= firstBarTime and (na(lastSupplyId) or sId != lastSupplyId)
+    lastSupplyId := sId
+    f_addZone(supplyZones, sTop, sBot, sLeft, SUPPLY_COL)
+f_maintain(demandZones, 1)
+f_maintain(supplyZones, -1)
+
+// ───────── The checklist (steps 3 and 4)
+// Returns the index of the box to trade (newest first), or -1.
+f_setup(array<Zone> zones, Leg g, int dir, bool sideOk) =>
+    bool absorbed = false
+    int back = bar_index - g.extBar
+    for k = -lookAround to lookAround
+        int off = back - k
+        if off >= 0 and off <= 400
+            if dir == 1 ? absorbLong[off] : absorbShort[off]
+                absorbed := true
+    bool exhausted = g.extVol <= exhMult
+    bool tapeOk = switch confMode
+        "Absorption" => absorbed
+        "Absorption or exhaustion" => absorbed or exhausted
+        "RSI divergence" => g.extDiv
+        "Any of them" => absorbed or exhausted or g.extDiv
+        => true
+    float stopLvl = g.ext - dir * stopBuf * atr5
+    float risk = dir * (close - stopLvl)
+    float rr = risk > 0 ? dir * (vwapNow - close) / risk : na
+    bool trendOk = trendDir == dir
+    bool pbOk = not needPb or (dir == 1 ? pbLowerHighs : pbHigherLows)
+    bool rrOk = rr >= minRR and rr <= maxRR
+    bool stopOk = risk / close * 100 >= minStopPct
+    bool dayOk = not (skipWeekend and (dayofweek == dayofweek.saturday or dayofweek == dayofweek.sunday))
+    int pick = -1
+    bool touchedAny = false
+    string why = ""
+    int i = zones.size() - 1
+    while i >= 0 and pick < 0
+        Zone z = zones.get(i)
+        // The tag: the leg traded into a box that was already on the chart.
+        bool touched = (dir == 1 ? g.ext <= z.top : g.ext >= z.bot) and g.extBar >= z.born
+        if touched
+            bool insideOk = not needInside or (close <= z.top and close >= z.bot)
+            bool sweepOk = not needSweep or (dir == 1 ? g.ext < z.bot : g.ext > z.top)
+            if trendOk and pbOk and insideOk and sweepOk and tapeOk and rrOk and stopOk and dayOk and sideOk
+                pick := i
+            else if not touchedAny
+                why := (trendOk ? "" : "trend ") + (pbOk ? "" : "pullback ") + (insideOk ? "" : "outside box ") + (sweepOk ? "" : "no sweep ") + (tapeOk ? "" : "no confirmation ") + (rrOk ? "" : na(rr) ? "VWAP n/a " : "VWAP " + str.tostring(rr, "#.0") + "R ") + (stopOk ? "" : "stop too tight ") + (dayOk ? "" : "weekend ") + (sideOk ? "" : "direction off ")
+            touchedAny := true
+        i -= 1
+    [pick, stopLvl, rr, touchedAny, tapeOk, why]
+
+f_enter(int dir, float stopLvl, float rr, float sweepLvl) =>
+    string id = dir == 1 ? "Long" : "Short"
+    float unitRisk = math.abs(close - stopLvl) * syminfo.pointvalue
+    float qty = math.min(strategy.equity * riskPct / 100 / unitRisk, strategy.equity * maxLev / (close * syminfo.pointvalue))
+    strategy.entry(id, dir == 1 ? strategy.long : strategy.short, qty = qty, comment = id + " " + str.tostring(rr, "#.0") + "R", alert_message = id + " " + syminfo.ticker + " stop " + str.tostring(stopLvl, format.mintick) + " target VWAP " + str.tostring(vwapNow, format.mintick))
+    strategy.exit(id + " exit", id, stop = stopLvl, limit = vwapNow, comment_loss = "Stop", comment_profit = "VWAP")
+    trade.stop := stopLvl
+    trade.target := vwapNow
+    trade.sweep := sweepLvl
+    trade.best := dir == 1 ? high : low
+    trade.bestBar := bar_index
+    trade.sess := sessId
+
+[lPick, lStop, lRR, lTouched, lTape, lWhy] = f_setup(demandZones, downLeg, 1, dirMode != "Short only")
+[sPick, sStop, sRR, sTouched, sTape, sWhy] = f_setup(supplyZones, upLeg, -1, dirMode != "Long only")
+bool flat = strategy.position_size == 0
+
+if shiftUp and lTouched
+    if lPick >= 0
+        if flat
+            f_enter(1, lStop, lRR, downLeg.ext)
+            // A box can only be used once.
+            f_retire(demandZones.remove(lPick), DEMAND_COL)
+    else if showRejects
+        label.new(bar_index, high, "✗ " + lWhy, style = label.style_label_down, color = color.new(color.gray, 75), textcolor = chart.fg_color, size = size.tiny)
+if shiftDn and sTouched
+    if sPick >= 0
+        if flat
+            f_enter(-1, sStop, sRR, upLeg.ext)
+            f_retire(supplyZones.remove(sPick), SUPPLY_COL)
+    else if showRejects
+        label.new(bar_index, low, "✗ " + sWhy, style = label.style_label_up, color = color.new(color.gray, 75), textcolor = chart.fg_color, size = size.tiny)
+
+// ───────── Display
+plot(vwapNow, "Session VWAP", color = color.orange)
+plot(strategy.position_size != 0 ? trade.stop : na, "Stop", color = color.red, style = plot.style_linebr)
+plot(strategy.position_size != 0 ? trade.target : na, "Target", color = color.green, style = plot.style_linebr)
+
+f_row(table t, int row, string name, string value, int state) =>
+    color bg = state > 0 ? color.new(color.green, 75) : state < 0 ? color.new(color.red, 80) : color.new(color.gray, 90)
+    t.cell(0, row, name, text_color = chart.fg_color, text_halign = text.align_left, text_size = size.small)
+    t.cell(1, row, value, text_color = chart.fg_color, text_halign = text.align_left, text_size = size.small, bgcolor = bg)
+
+if showPanel and barstate.islast
+    var table panel = table.new(position.top_right, 2, 6, bgcolor = chart.bg_color, frame_color = color.gray, frame_width = 1, border_color = color.new(color.gray, 70), border_width = 1)
+    bool up = trendDir == 1
+    bool chop = trendDir == 0
+    Leg g = up ? downLeg : upLeg
+    bool touched = up ? lTouched : sTouched
+    bool tape = up ? lTape : sTape
+    float rr = up ? lRR : sRR
+    bool pbOk = up ? pbLowerHighs : pbHigherLows
+    int boxes = up ? demandZones.size() : supplyZones.size()
+    f_row(panel, 0, "1 · 4H trend", chop ? "Choppy: stand down" : up ? "Up: buy only" : "Down: sell only", chop ? -1 : 1)
+    f_row(panel, 1, "2 · Box", chop ? "-" : touched ? "Price traded into a box" : str.tostring(boxes) + " waiting", chop ? 0 : touched ? 1 : -1)
+    f_row(panel, 2, "    30m pullback", chop ? "-" : up ? (pbOk ? "Lower highs" : "No lower highs") : (pbOk ? "Higher lows" : "No higher lows"), chop or not needPb ? 0 : pbOk ? 1 : -1)
+    f_row(panel, 3, "3 · 5m shift", chop or na(g.level) ? "-" : g.broken ? "Closed through " + str.tostring(g.level, format.mintick) : (up ? "Needs a close above " : "Needs a close below ") + str.tostring(g.level, format.mintick), chop or na(g.level) ? 0 : g.broken ? 1 : -1)
+    f_row(panel, 4, "4 · Confirmation", chop ? "-" : confMode == "Off" ? "Off" : na(volume) ? "No volume data" : tape ? confMode + " seen" : "Not seen", chop or confMode == "Off" ? 0 : tape ? 1 : -1)
+    f_row(panel, 5, "5 · VWAP", chop ? "-" : na(rr) ? "n/a" : str.tostring(rr, "#.0") + "R away", chop ? 0 : rr >= minRR and rr <= maxRR ? 1 : -1)
