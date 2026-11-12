@@ -1,0 +1,156 @@
+//@version=6
+indicator("FCR One Candle Strategy (9:30 First Candle Range)", shorttitle = "FCR Strategy", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// ────────────────────────── Inputs ──────────────────────────
+grpR = "First Candle Range"
+tzIn   = input.string("America/New_York", "Timezone", group = grpR)
+orSess = input.session("0930-0935", "Opening candle window (first 5 min)", group = grpR)
+trSess = input.session("0930-1100", "Trading window (signals allowed)", group = grpR)
+
+grpS = "Signals"
+rrMult     = input.float(3.0, "Risk : Reward", minval = 0.5, step = 0.5, group = grpS)
+onePerDay  = input.bool(true, "Max one signal per day", group = grpS)
+needRetest = input.bool(true, "Require FVG retest before entry", group = grpS)
+
+grpV = "Visuals"
+showOR    = input.bool(true, "Show first-candle high/low", group = grpV)
+showFVG   = input.bool(true, "Show fair value gap", group = grpV)
+showTrade = input.bool(true, "Show entry / stop / target", group = grpV)
+colRange  = input.color(color.new(color.gray, 0),  "Range lines", group = grpV)
+colBull   = input.color(color.new(color.teal, 80), "Bull FVG",    group = grpV)
+colBear   = input.color(color.new(color.red, 80),  "Bear FVG",    group = grpV)
+
+// ────────────────────────── State ──────────────────────────
+var float orHigh     = na
+var float orLow      = na
+var int   orStartBar = na
+var bool  orDone     = false
+var int   bias       = 0      // 0 = none, 1 = broke high, -1 = broke low
+var bool  fired      = false
+
+var float fvgTop      = na
+var float fvgBot      = na
+var int   fvgBar      = na
+var bool  fvgRetested = false
+var box   fvgBox      = na
+var line  hiLine      = na
+var line  loLine      = na
+
+newDay  = ta.change(time("D")) != 0
+inOR    = not na(time(timeframe.period, orSess, tzIn))
+inTrade = not na(time(timeframe.period, trSess, tzIn))
+
+if newDay
+    orHigh      := na
+    orLow       := na
+    orStartBar  := na
+    orDone      := false
+    bias        := 0
+    fired       := false
+    fvgTop      := na
+    fvgBot      := na
+    fvgBar      := na
+    fvgRetested := false
+    fvgBox      := na
+    hiLine      := na
+    loLine      := na
+
+// ─────────────── Build the first-candle range (FCR) ───────────────
+if inOR
+    if na(orStartBar)
+        orStartBar := bar_index
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow  := na(orLow)  ? low  : math.min(orLow,  low)
+
+if not orDone and not inOR and not na(orHigh)
+    orDone := true
+    if showOR
+        hiLine := line.new(orStartBar, orHigh, bar_index, orHigh, xloc.bar_index, extend.none, colRange, line.style_dotted, 2)
+        loLine := line.new(orStartBar, orLow,  bar_index, orLow,  xloc.bar_index, extend.none, colRange, line.style_dotted, 2)
+
+if inTrade and not na(hiLine)
+    line.set_x2(hiLine, bar_index)
+    line.set_x2(loLine, bar_index)
+
+// ─────────────── Breakout of the two levels ───────────────
+breakUp   = orDone and inTrade and bias == 0 and close > orHigh
+breakDown = orDone and inTrade and bias == 0 and close < orLow
+if breakUp
+    bias := 1
+if breakDown
+    bias := -1
+
+// ─────────────── Fair value gap on the breakout leg ───────────────
+bullFVG = low > high[2]
+bearFVG = high < low[2]
+
+if inTrade and not fired and not fvgRetested
+    if bias == 1 and bullFVG
+        fvgTop := low
+        fvgBot := high[2]
+        fvgBar := bar_index
+        if showFVG
+            box.delete(fvgBox)
+            fvgBox := box.new(bar_index - 2, fvgTop, bar_index + 1, fvgBot, border_color = na, bgcolor = colBull)
+    if bias == -1 and bearFVG
+        fvgTop := low[2]
+        fvgBot := high
+        fvgBar := bar_index
+        if showFVG
+            box.delete(fvgBox)
+            fvgBox := box.new(bar_index - 2, fvgTop, bar_index + 1, fvgBot, border_color = na, bgcolor = colBear)
+
+if not na(fvgBox) and inTrade and not fired
+    box.set_right(fvgBox, bar_index + 1)
+
+// ─────────────── Retest of the gap ───────────────
+if not fvgRetested and not na(fvgTop) and bar_index > fvgBar
+    if bias == 1 and low <= fvgTop
+        fvgRetested := true
+    if bias == -1 and high >= fvgBot
+        fvgRetested := true
+
+// ─────────────── Engulfing entry ───────────────
+bullEngulf = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+bearEngulf = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+
+canSignal = orDone and inTrade and not fired and not na(fvgTop) and (fvgRetested or not needRetest)
+longSig   = canSignal and bias == 1  and bullEngulf
+shortSig  = canSignal and bias == -1 and bearEngulf
+
+if longSig or shortSig
+    entry = close
+    stop  = longSig ? math.min(low, fvgBot) : math.max(high, fvgTop)
+    risk  = math.abs(entry - stop)
+    tgt   = longSig ? entry + rrMult * risk : entry - rrMult * risk
+    if showTrade and risk > 0
+        line.new(bar_index, entry, bar_index + 20, entry, color = color.gray,  width = 2)
+        line.new(bar_index, stop,  bar_index + 20, stop,  color = color.red,   width = 2)
+        line.new(bar_index, tgt,   bar_index + 20, tgt,   color = color.green, width = 2)
+        label.new(bar_index + 20, entry, "Entry " + str.tostring(entry, format.mintick), style = label.style_label_left, color = color.new(color.gray, 100),  textcolor = color.gray)
+        label.new(bar_index + 20, stop,  "Stop "  + str.tostring(stop,  format.mintick), style = label.style_label_left, color = color.new(color.red, 100),   textcolor = color.red)
+        label.new(bar_index + 20, tgt,   str.tostring(rrMult, "#.#") + "R  " + str.tostring(tgt, format.mintick), style = label.style_label_left, color = color.new(color.green, 100), textcolor = color.green)
+    if onePerDay
+        fired := true
+    else
+        // allow the next gap setup later in the window
+        fvgTop      := na
+        fvgBot      := na
+        fvgRetested := false
+
+plotshape(longSig,  "Long entry",  shape.triangleup,   location.belowbar, color.green, size = size.small, text = "LONG")
+plotshape(shortSig, "Short entry", shape.triangledown, location.abovebar, color.red,   size = size.small, text = "SHORT")
+plotshape(breakUp,   "Break of high", shape.circle, location.abovebar, color.new(color.gray, 30), size = size.tiny)
+plotshape(breakDown, "Break of low",  shape.circle, location.belowbar, color.new(color.gray, 30), size = size.tiny)
+
+// ─────────────── Alerts ───────────────
+alertcondition(breakUp,   "FCR high breakout", "Price closed above the first 5-min candle high")
+alertcondition(breakDown, "FCR low breakout",  "Price closed below the first 5-min candle low")
+alertcondition(longSig,   "FCR long entry",    "Bullish engulfing after FVG retest above the first-candle high")
+alertcondition(shortSig,  "FCR short entry",   "Bearish engulfing after FVG retest below the first-candle low")
+
+// ─────────────── Chart-timeframe hint ───────────────
+var table info = table.new(position.top_right, 1, 1)
+if barstate.islast
+    tfOk = not timeframe.isdwm and timeframe.in_seconds() <= 300
+    table.cell(info, 0, 0, tfOk ? "" : "⚠ Use a 1–5 minute chart", text_color = color.red, text_size = size.small)
