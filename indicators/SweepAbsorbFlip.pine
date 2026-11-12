@@ -1,0 +1,314 @@
+//@version=6
+// Sweep-Absorb-Flip: intraday framework indicator (context -> location -> trigger -> management).
+//   Context : tags the day A (trend) or B (balance); C (no trade) is a manual switch for event days.
+//   Location: prior-day high/low/close/VWAP, today's open, opening range, round numbers.
+//   Reversal (B days only): 1) sweep-and-fail of a level, 2) absorption (volume peak + close back
+//             in the far half of the sweep range), 3) structure flip, then entry on the retest that holds.
+//   Continuation (A days only, with the trend): acceptance beyond a level, then a quiet pullback that holds.
+// Absorption is a volume proxy: Pine has no order-flow delta. Signals are evaluated on closed bars only.
+indicator("Sweep-Absorb-Flip Day Trading Framework", shorttitle = "SAF", overlay = true, max_lines_count = 300, max_labels_count = 300)
+
+//--- Inputs
+grpC = "1. Context"
+tagMode   = input.string("Auto", "Day tag", options = ["Auto", "A (trend)", "B (balance)", "C (no trade)"], group = grpC)
+slopeLen  = input.int(30, "VWAP slope lookback (bars)", minval = 2, group = grpC)
+flatAtr   = input.float(0.5, "VWAP is flat if it moved less than (x ATR)", minval = 0, step = 0.1, group = grpC)
+useSess   = input.bool(true, "Only start setups inside the sessions below (UTC)", group = grpC)
+sess1     = input.session("0700-1000", "Session 1 (London open)", group = grpC)
+sess2     = input.session("1200-1600", "Session 2 (NY overlap)", group = grpC)
+
+grpL = "2. Location"
+orMin     = input.int(30, "Opening range (minutes)", minval = 1, group = grpL)
+roundStep = input.float(50.0, "Round-number step (0 = off)", minval = 0, group = grpL)
+showLvls  = input.bool(true, "Plot levels", group = grpL)
+
+grpT = "3. Trigger"
+sweepBars = input.int(3, "Sweep must fail within (bars)", minval = 1, maxval = 20, group = grpT)
+useVol    = input.bool(true, "Require volume tests", group = grpT)
+volLen    = input.int(20, "Volume average length", minval = 2, group = grpT)
+volMult   = input.float(1.5, "Absorption: volume peak >= (x average)", minval = 0.1, step = 0.1, group = grpT)
+pivLen    = input.int(3, "Swing length for structure flip", minval = 1, group = grpT)
+retestTol = input.float(0.25, "Retest / pullback tolerance (x ATR)", minval = 0, step = 0.05, group = grpT)
+accBars   = input.int(3, "Acceptance: closes beyond level", minval = 2, maxval = 20, group = grpT)
+maxWait   = input.int(30, "Cancel a setup after (bars)", minval = 3, group = grpT)
+
+grpM = "4. Management"
+maxRiskAtr = input.float(2.0, "Skip if stop distance > (x ATR)", minval = 0.1, step = 0.1, group = grpM)
+maxTrades  = input.int(2, "Max signals per day", minval = 1, group = grpM)
+fallbackRR = input.float(2.0, "Target R if no level ahead", minval = 0.5, step = 0.5, group = grpM)
+showDash   = input.bool(true, "Show dashboard", group = grpM)
+
+if not timeframe.isintraday
+    runtime.error("Sweep-Absorb-Flip needs an intraday timeframe.")
+
+//--- Series
+atr     = ta.atr(14)
+vwap    = ta.vwap(hlc3)
+volAvg  = ta.sma(volume, volLen)
+vol2    = ta.sma(volume, 2)
+volPeak = ta.highest(volume, sweepBars)
+loN     = ta.lowest(low, sweepBars)
+hiN     = ta.highest(high, sweepBars)
+loC     = ta.lowest(close, accBars)
+hiC     = ta.highest(close, accBars)
+c1      = close[1]
+cN      = close[sweepBars]
+cA      = close[accBars]
+ph      = ta.pivothigh(high, pivLen, pivLen)
+pl      = ta.pivotlow(low, pivLen, pivLen)
+newDay  = timeframe.change("D")
+inSess  = not useSess or not na(time(timeframe.period, sess1, "UTC")) or not na(time(timeframe.period, sess2, "UTC"))
+
+var float lastPH = na
+var float lastPL = na
+if not na(ph)
+    lastPH := ph
+if not na(pl)
+    lastPL := pl
+
+//--- Setup state: 0 idle, 1 swept+absorbed (wait flip), 2 flipped (wait retest), 3 accepted (wait pullback)
+var int    state      = 0
+var int    dir        = 0
+var float  setupLevel = na
+var string setupName  = ""
+var int    setupBar   = na
+var float  sweepExt   = na
+var float  flipLevel  = na
+var bool   pulled     = false
+var int    tradesToday = 0
+// A level is tried once per day: if the first attempt fails, it is done.
+var array<float> used = array.new<float>()
+
+//--- Day levels
+var float dayHi = na
+var float dayLo = na
+var float pdh = na
+var float pdl = na
+var float pdc = na
+var float pdVwap = na
+var float dayOpen = na
+var float orHi = na
+var float orLo = na
+var int dayStart = na
+var int barsInDay = 0
+
+if newDay
+    pdh := dayHi
+    pdl := dayLo
+    pdc := close[1]
+    pdVwap := vwap[1]
+    dayOpen := open
+    dayHi := high
+    dayLo := low
+    orHi := high
+    orLo := low
+    dayStart := time
+    barsInDay := 0
+    tradesToday := 0
+    state := 0
+    used.clear()
+else
+    dayHi := math.max(nz(dayHi, high), high)
+    dayLo := math.min(nz(dayLo, low), low)
+    barsInDay += 1
+
+inOR   = not na(dayStart) and time < dayStart + orMin * 60000
+orDone = not na(dayStart) and not inOR
+if inOR and not newDay
+    orHi := math.max(orHi, high)
+    orLo := math.min(orLo, low)
+
+rnLo = roundStep > 0 ? math.floor(close[1] / roundStep) * roundStep : na
+rnHi = roundStep > 0 ? rnLo + roundStep : na
+
+levels = array.from(pdh, pdl, pdc, pdVwap, dayOpen, orDone ? orHi : na, orDone ? orLo : na, rnLo, rnHi)
+names  = array.from("PDH", "PDL", "PD close", "PD VWAP", "Open", "OR high", "OR low", "Round", "Round")
+
+//--- Context: day tag
+vwapMove = vwap - vwap[math.min(slopeLen, barsInDay)]
+vwapFlat = math.abs(vwapMove) < flatAtr * atr
+autoUp   = close > vwap and vwapMove > 0 and not vwapFlat and dayHi > pdh
+autoDn   = close < vwap and vwapMove < 0 and not vwapFlat and dayLo < pdl
+noTrade  = tagMode == "C (no trade)"
+trendDir = tagMode == "Auto" ? (autoUp ? 1 : autoDn ? -1 : 0) : tagMode == "A (trend)" ? (close > vwap ? 1 : -1) : 0
+isBalance = not noTrade and trendDir == 0
+dayTag   = noTrade ? "C" : trendDir != 0 ? "A" : "B"
+
+//--- Helpers
+isUsed(float lvl) =>
+    bool found = false
+    for u in used
+        if math.abs(u - lvl) < syminfo.mintick * 0.5
+            found := true
+            break
+    found
+
+// Nearest level ahead of price in direction d, at least minDist away.
+nextLevel(array<float> arr, float price, int d, float minDist) =>
+    float best = na
+    for lvl in arr
+        if not na(lvl) and d * (lvl - price) >= minDist
+            if na(best) or d * (lvl - best) < 0
+                best := lvl
+    best
+
+//--- Tests at the levels
+sweepRange  = hiN - loN
+closeLoc    = sweepRange > 0 ? (close - loN) / sweepRange : 0.5
+volOk       = not useVol or volPeak >= volMult * volAvg[sweepBars]
+absorbLong  = volOk and closeLoc >= 0.5
+absorbShort = volOk and closeLoc <= 0.5
+canStart    = not noTrade and inSess and tradesToday < maxTrades
+
+int    hitDir   = 0
+int    hitKind  = 0 // 1 reversal, 2 continuation
+float  hitLevel = na
+string hitName  = ""
+bool   sweepNoAbsorb = false
+
+if barstate.isconfirmed and state == 0 and canStart
+    for i = 0 to levels.size() - 1
+        float lvl = levels.get(i)
+        if na(lvl) or isUsed(lvl)
+            continue
+        // Sweep and fail: traded through the level, closed back inside, having come from inside.
+        bool lSw  = isBalance and loN < lvl and close > lvl and (low < lvl or c1 <= lvl) and cN > lvl
+        bool sSw  = isBalance and hiN > lvl and close < lvl and (high > lvl or c1 >= lvl) and cN < lvl
+        // Acceptance: several consecutive closes beyond the level, in the trend direction.
+        bool lAcc = trendDir == 1 and loC > lvl and cA <= lvl
+        bool sAcc = trendDir == -1 and hiC < lvl and cA >= lvl
+        if lSw or sSw
+            if (lSw ? absorbLong : absorbShort)
+                hitDir := lSw ? 1 : -1
+                hitKind := 1
+            else
+                sweepNoAbsorb := true
+        else if lAcc or sAcc
+            hitDir := lAcc ? 1 : -1
+            hitKind := 2
+        if hitDir != 0
+            hitLevel := lvl
+            hitName := names.get(i)
+            break
+
+//--- State machine
+bool setupLong  = false
+bool setupShort = false
+bool flipLong   = false
+bool flipShort  = false
+int    entryDir  = 0
+float  entryStop = na
+string entryKind = ""
+
+if barstate.isconfirmed
+    if state == 0
+        if hitDir != 0
+            dir := hitDir
+            setupLevel := hitLevel
+            setupName := hitName
+            setupBar := bar_index
+            pulled := false
+            used.push(hitLevel)
+            if hitKind == 1
+                state := 1
+                sweepExt := dir == 1 ? loN : hiN
+                // Flip level: nearest recent swing against the move, else the sweep-window extreme.
+                if dir == 1
+                    flipLevel := lastPH > close and lastPH - close <= maxRiskAtr * atr ? lastPH : hiN
+                else
+                    flipLevel := lastPL < close and close - lastPL <= maxRiskAtr * atr ? lastPL : loN
+                setupLong := dir == 1
+                setupShort := dir == -1
+            else
+                state := 3
+    else if bar_index - setupBar > maxWait or dir * (close - setupLevel) < 0
+        // Timed out, or price closed back through the level (acceptance against the setup).
+        state := 0
+    else if state == 1
+        sweepExt := dir == 1 ? math.min(sweepExt, low) : math.max(sweepExt, high)
+        if dir * (close - flipLevel) > 0
+            state := 2
+            flipLong := dir == 1
+            flipShort := dir == -1
+    else if state == 2
+        if (dir == 1 ? low < sweepExt : high > sweepExt)
+            state := 0
+        else if dir * (flipLevel - (dir == 1 ? low : high)) >= -retestTol * atr and dir * (close - flipLevel) > 0
+            entryDir := dir
+            entryStop := sweepExt
+            entryKind := "REV"
+    else if state == 3
+        float sup = setupLevel
+        if dir * (vwap - setupLevel) > 0 and dir * (close - vwap) > 0
+            sup := vwap
+        bool touched = dir * (sup - (dir == 1 ? low : high)) >= -retestTol * atr
+        bool quiet   = not useVol or vol2 < volAvg
+        if pulled and touched and quiet and dir * (close - open) > 0 and dir * (close - sup) > 0
+            entryDir := dir
+            entryStop := dir == 1 ? math.min(low, low[1], setupLevel) : math.max(high, high[1], setupLevel)
+            entryKind := "CONT"
+        if dir * (close - close[1]) < 0
+            pulled := true
+
+//--- Entry: stop beyond the extreme, target the next level
+bool revLong   = false
+bool revShort  = false
+bool contLong  = false
+bool contShort = false
+
+if entryDir != 0
+    float risk = math.abs(close - entryStop)
+    if risk <= 0 or risk > maxRiskAtr * atr
+        label.new(bar_index, entryDir == 1 ? low : high, "skip: risk " + str.tostring(risk / atr, "#.#") + " ATR", style = entryDir == 1 ? label.style_label_up : label.style_label_down, color = color.gray, textcolor = color.white, size = size.small)
+    else
+        float tgt = nextLevel(levels, close, entryDir, risk)
+        if na(tgt)
+            tgt := close + entryDir * fallbackRR * risk
+        tradesToday += 1
+        color c = entryDir == 1 ? color.teal : color.red
+        line.new(bar_index, close, bar_index + 20, close, color = c, width = 2)
+        line.new(bar_index, entryStop, bar_index + 20, entryStop, color = color.orange, style = line.style_dashed)
+        line.new(bar_index, tgt, bar_index + 20, tgt, color = color.blue, style = line.style_dashed)
+        string txt = entryKind + (entryDir == 1 ? " LONG @ " : " SHORT @ ") + setupName + "\nSL " + str.tostring(entryStop, format.mintick) + "  TP " + str.tostring(tgt, format.mintick) + "  (" + str.tostring(math.abs(tgt - close) / risk, "#.#") + "R)"
+        label.new(bar_index, entryDir == 1 ? low : high, txt, style = entryDir == 1 ? label.style_label_up : label.style_label_down, color = c, textcolor = color.white, size = size.small)
+        revLong   := entryKind == "REV" and entryDir == 1
+        revShort  := entryKind == "REV" and entryDir == -1
+        contLong  := entryKind == "CONT" and entryDir == 1
+        contShort := entryKind == "CONT" and entryDir == -1
+    state := 0
+
+//--- Plots
+lc(color c) => showLvls and not newDay ? c : na
+plot(vwap, "VWAP", color = color.new(color.purple, 0), linewidth = 2)
+plot(pdh, "Prior day high", color = lc(color.gray), style = plot.style_linebr)
+plot(pdl, "Prior day low", color = lc(color.gray), style = plot.style_linebr)
+plot(pdc, "Prior day close", color = lc(color.new(color.gray, 50)), style = plot.style_linebr)
+plot(pdVwap, "Prior day VWAP", color = lc(color.new(color.purple, 50)), style = plot.style_linebr)
+plot(dayOpen, "Session open", color = lc(color.new(color.blue, 30)), style = plot.style_linebr)
+plot(orDone ? orHi : na, "Opening range high", color = lc(color.new(color.orange, 30)), style = plot.style_linebr)
+plot(orDone ? orLo : na, "Opening range low", color = lc(color.new(color.orange, 30)), style = plot.style_linebr)
+
+plotshape(setupLong, "Sweep + absorption (long)", shape.circle, location.belowbar, color.teal, size = size.tiny)
+plotshape(setupShort, "Sweep + absorption (short)", shape.circle, location.abovebar, color.red, size = size.tiny)
+plotshape(flipLong, "Structure flip (long)", shape.diamond, location.belowbar, color.teal, size = size.tiny)
+plotshape(flipShort, "Structure flip (short)", shape.diamond, location.abovebar, color.red, size = size.tiny)
+plotshape(sweepNoAbsorb, "Sweep without absorption (no trade)", shape.xcross, location.abovebar, color.gray, size = size.tiny)
+
+//--- Dashboard
+var table dash = table.new(position.top_right, 2, 3, bgcolor = color.new(color.black, 70), border_width = 1)
+if barstate.islast and showDash
+    string tagTxt = dayTag == "A" ? "A - trend " + (trendDir == 1 ? "up" : "down") + ": continuation only" : dayTag == "B" ? "B - balance: reversals at edges" : "C - no trade"
+    string phase = noTrade ? "Platform shut" : tradesToday >= maxTrades ? "Done for today" : state == 1 ? "Swept + absorbed at " + setupName + ": wait for flip" : state == 2 ? "Flipped: wait for retest to hold" : state == 3 ? "Accepted beyond " + setupName + ": wait for quiet pullback" : inSess ? "Waiting for price at a level" : "Outside session"
+    table.cell(dash, 0, 0, "Day", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 0, tagTxt, text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 1, "Phase", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 1, phase, text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 2, "Signals", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 2, str.tostring(tradesToday) + " / " + str.tostring(maxTrades), text_color = color.white, text_size = size.small)
+
+//--- Alerts
+alertcondition(setupLong or setupShort, "Sweep + absorption at a level", "SAF: sweep and absorption at a level - wait for the structure flip")
+alertcondition(revLong, "Reversal long entry", "SAF: reversal LONG - retest held, stop below the sweep low")
+alertcondition(revShort, "Reversal short entry", "SAF: reversal SHORT - retest held, stop above the sweep high")
+alertcondition(contLong, "Continuation long entry", "SAF: continuation LONG - quiet pullback held")
+alertcondition(contShort, "Continuation short entry", "SAF: continuation SHORT - quiet pullback held")
