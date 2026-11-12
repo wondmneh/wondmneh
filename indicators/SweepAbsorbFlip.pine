@@ -269,8 +269,8 @@ if entryDir != 0
         line.new(bar_index, close, bar_index + 20, close, color = c, width = 2)
         line.new(bar_index, entryStop, bar_index + 20, entryStop, color = color.orange, style = line.style_dashed)
         line.new(bar_index, tgt, bar_index + 20, tgt, color = color.blue, style = line.style_dashed)
-        string txt = entryKind + (entryDir == 1 ? " LONG @ " : " SHORT @ ") + setupName + "\nSL " + str.tostring(entryStop, format.mintick) + "  TP " + str.tostring(tgt, format.mintick) + "  (" + str.tostring(math.abs(tgt - close) / risk, "#.#") + "R)"
-        label.new(bar_index, entryDir == 1 ? low : high, txt, style = entryDir == 1 ? label.style_label_up : label.style_label_down, color = c, textcolor = color.white, size = size.small)
+        string txt = (entryDir == 1 ? "BUY" : "SELL") + "\n" + (entryKind == "REV" ? "reversal @ " : "continuation @ ") + setupName + "\nSL " + str.tostring(entryStop, format.mintick) + "  TP " + str.tostring(tgt, format.mintick) + "  (" + str.tostring(math.abs(tgt - close) / risk, "#.#") + "R)"
+        label.new(bar_index, entryDir == 1 ? low : high, txt, style = entryDir == 1 ? label.style_label_up : label.style_label_down, color = c, textcolor = color.white, size = size.normal)
         revLong   := entryKind == "REV" and entryDir == 1
         revShort  := entryKind == "REV" and entryDir == -1
         contLong  := entryKind == "CONT" and entryDir == 1
@@ -308,6 +308,8 @@ if barstate.islast and showDash
 
 //--- Alerts
 alertcondition(setupLong or setupShort, "Sweep + absorption at a level", "SAF: sweep and absorption at a level - wait for the structure flip")
+alertcondition(revLong or contLong, "BUY signal", "SAF: BUY signal - stop and target are on the chart label")
+alertcondition(revShort or contShort, "SELL signal", "SAF: SELL signal - stop and target are on the chart label")
 alertcondition(revLong, "Reversal long entry", "SAF: reversal LONG - retest held, stop below the sweep low")
 alertcondition(revShort, "Reversal short entry", "SAF: reversal SHORT - retest held, stop above the sweep high")
 alertcondition(contLong, "Continuation long entry", "SAF: continuation LONG - quiet pullback held")
