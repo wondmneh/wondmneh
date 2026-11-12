@@ -1,0 +1,183 @@
+//@version=6
+indicator("Triangle Breakout Buy/Sell", "TriBrk", overlay = true)
+
+// Falling trendline from the swing high + flat support.
+// SELL: close below support.
+// BUY: close above the trendline, support reclaimed after a breakdown,
+//      or reversal after the target was hit.
+// All state changes happen on closed bars only (no repaint).
+
+grpP = "Pattern Detection"
+pivLen     = input.int(5, "Swing strength (bars each side)", minval = 1, group = grpP)
+lookback   = input.int(300, "Lookback for the pattern (bars)", minval = 20, group = grpP)
+minSpan    = input.int(20, "Min bars between trendline anchors", minval = 1, group = grpP)
+minTouches = input.int(2, "Min swing lows on support", minval = 1, group = grpP)
+flatTol    = input.float(1.0, "Support flatness tolerance (ATR)", minval = 0, step = 0.1, group = grpP)
+minHeight  = input.float(5.0, "Min pattern height (ATR)", minval = 0, step = 0.5, group = grpP)
+atrLen     = input.int(14, "ATR period", minval = 1, group = grpP)
+
+grpS = "Signals"
+breakBuf   = input.float(0.25, "Close beyond level by (ATR)", minval = 0, step = 0.05, group = grpS)
+targetFrac = input.float(0.33, "Target = support - height x", minval = 0, step = 0.01, group = grpS)
+manualTgt  = input.float(0.0, "Manual target price (0 = auto)", minval = 0, group = grpS)
+revBars    = input.int(3, "Reversal: close above high of N bars", minval = 1, group = grpS)
+maxAfter   = input.int(150, "Give up on reversal after N bars", minval = 1, group = grpS)
+
+grpD = "Display"
+lineCol    = input.color(color.silver, "Trendline / support color", group = grpD)
+tgtCol     = input.color(color.orange, "Target color", group = grpD)
+
+atr = ta.atr(atrLen)
+ph  = ta.pivothigh(high, pivLen, pivLen)
+pl  = ta.pivotlow(low, pivLen, pivLen)
+hh  = ta.highest(high, revBars)[1]
+
+// Confirmed swings inside the lookback window
+var array<int>   phBar   = array.new<int>()
+var array<float> phPrice = array.new<float>()
+var array<int>   plBar   = array.new<int>()
+var array<float> plPrice = array.new<float>()
+
+if barstate.isconfirmed
+    if not na(ph)
+        phBar.push(bar_index - pivLen)
+        phPrice.push(ph)
+    if not na(pl)
+        plBar.push(bar_index - pivLen)
+        plPrice.push(pl)
+    while phBar.size() > 0 and phBar.first() < bar_index - lookback
+        phBar.shift()
+        phPrice.shift()
+    while plBar.size() > 0 and plBar.first() < bar_index - lookback
+        plBar.shift()
+        plPrice.shift()
+
+// Fit the pattern from swings at or after bar `lo`
+fit(int lo, float atrv) =>
+    int   a     = na
+    float top   = na
+    float slope = na
+    int   b     = na
+    float sup   = na
+    int   touches = 0
+    n = phBar.size()
+    m = plBar.size()
+    // Anchor: highest swing high in the window
+    if n > 0
+        for k = 0 to n - 1
+            p = phBar.get(k)
+            if p >= lo
+                pr = phPrice.get(k)
+                if na(a) or pr >= top
+                    a := p
+                    top := pr
+    if not na(a)
+        // Trendline: flattest line from the anchor that no later swing high pierces
+        for k = 0 to n - 1
+            p = phBar.get(k)
+            if p > a
+                s = (phPrice.get(k) - top) / (p - a)
+                if na(slope) or s > slope
+                    slope := s
+                    b := p
+        // Support: lowest swing low after the anchor, with enough lows resting near it
+        if m > 0
+            for k = 0 to m - 1
+                if plBar.get(k) > a
+                    pr = plPrice.get(k)
+                    sup := na(sup) ? pr : math.min(sup, pr)
+            if not na(sup)
+                for k = 0 to m - 1
+                    if plBar.get(k) > a and plPrice.get(k) <= sup + flatTol * atrv
+                        touches += 1
+    bool ok = false
+    if not na(a) and not na(b) and not na(sup)
+        ok := slope < 0 and b - a >= minSpan and touches >= minTouches and top - sup >= minHeight * atrv and top + slope * (bar_index - a) > sup
+    [ok, a, top, slope, sup]
+
+// state: 0 = searching, 1 = inside the pattern, 2 = broke down, waiting for a buy
+var int   state    = 0
+var int   fromBar  = 0
+var int   breakBar = 0
+var bool  reached  = false
+var float target   = na
+var int   tA       = 0
+var float tTop     = na
+var float tSlope   = na
+var float tSup     = na
+
+bool  buySig  = false
+bool  sellSig = false
+float resV    = na
+float supV    = na
+float tgtV    = na
+
+if barstate.isconfirmed and not na(atr) and atr > 0
+    buf = breakBuf * atr
+    if state <= 1
+        [ok, nA, nTop, nSlope, nSup] = fit(math.max(fromBar, bar_index - lookback), atr)
+        if ok
+            nl = nTop + nSlope * (bar_index - nA)
+            if close <= nl + buf and close >= nSup - buf
+                tA := nA
+                tTop := nTop
+                tSlope := nSlope
+                tSup := nSup
+                state := 1
+        if state == 1
+            ln = tTop + tSlope * (bar_index - tA)
+            if ln <= tSup
+                state := 0
+                fromBar := bar_index
+            else if close < tSup - buf
+                sellSig := true
+                state := 2
+                breakBar := bar_index
+                reached := false
+                target := manualTgt > 0 ? manualTgt : tSup - targetFrac * (tTop - tSup)
+            else if close > ln + buf
+                buySig := true
+                state := 0
+                fromBar := bar_index
+            else
+                resV := ln
+                supV := tSup
+    else
+        if low <= target
+            reached := true
+        // Failed breakdown (support reclaimed) or reversal after the target was hit
+        if close > tSup + buf or (reached and close > hh)
+            buySig := true
+            state := 0
+            fromBar := bar_index
+        else if bar_index - breakBar > maxAfter
+            state := 0
+            fromBar := bar_index
+        else
+            supV := tSup
+            tgtV := target
+
+plot(resV, "Resistance", color = lineCol, style = plot.style_linebr)
+plot(supV, "Support", color = lineCol, style = plot.style_linebr)
+plot(tgtV, "Target", color = tgtCol, linewidth = 2, style = plot.style_linebr)
+
+plotshape(buySig, "Buy", shape.labelup, location.belowbar, color.green, text = "BUY", textcolor = color.white, size = size.small)
+plotshape(sellSig, "Sell", shape.labeldown, location.abovebar, color.red, text = "SELL", textcolor = color.white, size = size.small)
+
+// Full-length lines for the pattern that is still live
+var line lRes = na
+var line lSup = na
+var line lTgt = na
+if barstate.islast
+    line.delete(lRes)
+    line.delete(lSup)
+    line.delete(lTgt)
+    if state > 0
+        lSup := line.new(tA, tSup, bar_index, tSup, extend = extend.right, color = lineCol, width = 2)
+    if state == 1
+        lRes := line.new(tA, tTop, bar_index, tTop + tSlope * (bar_index - tA), extend = extend.right, color = lineCol, width = 2)
+    if state == 2
+        lTgt := line.new(breakBar, target, bar_index + 1, target, extend = extend.right, color = tgtCol, width = 2)
+
+alertcondition(buySig, "Triangle Breakout BUY", "Triangle Breakout BUY on {{ticker}} {{interval}} at {{close}}")
+alertcondition(sellSig, "Triangle Breakout SELL", "Triangle Breakout SELL on {{ticker}} {{interval}} at {{close}}")
