@@ -1,0 +1,304 @@
+//@version=6
+indicator("Trend Zone VWAP Setup (4H / 30m / 5m)", "TZ-VWAP", overlay = true, max_boxes_count = 100, max_lines_count = 300, max_labels_count = 300)
+
+// Apply on a 5-minute chart. Workflow:
+//   1. Trend    - higher highs + higher lows (buy) or lower highs + lower lows (sell) on the trend timeframe.
+//   2. Zone     - base of the last strong move in the trend direction.
+//   3. Pullback - price returns to the zone; a pullback-timeframe close through the zone cancels it.
+//   4. Trigger  - tag of the zone, close through the last lower high (higher low for sells), tape proxy.
+//   5. Trade    - entry on the shift close, stop beyond the sweep, target VWAP (minimum R required).
+//   6. Exit     - close back through the sweep, or stall without progress towards VWAP.
+// Pine has no access to the order book or time and sales, so "tape confirmation" is a
+// volume/wick proxy. Confirm absorption or exhaustion on the real tape before taking a signal.
+
+// ───────── Inputs ─────────
+string GRP_T = "1 · Trend"
+string trendTf    = input.timeframe("240", "Trend timeframe", group = GRP_T)
+int    trendPivot = input.int(3, "Swing length (bars each side)", minval = 1, group = GRP_T)
+string dirMode    = input.string("Both", "Trade direction", options = ["Both", "Long only", "Short only"], group = GRP_T)
+
+string GRP_Z = "2-3 · Zone and pullback"
+string zoneTf    = input.timeframe("30", "Zone timeframe", group = GRP_Z)
+float  impMult   = input.float(1.5, "Strong move: candle body ≥ ATR ×", minval = 0.5, step = 0.1, group = GRP_Z)
+int    impAtrLen = input.int(14, "ATR length for strong move", minval = 1, group = GRP_Z)
+string breakTf   = input.timeframe("30", "Zone is cancelled by a close through it on", group = GRP_Z)
+
+string GRP_S = "4 · Trigger"
+int   shiftPivot = input.int(2, "Swing length for last lower high / higher low", minval = 1, group = GRP_S)
+bool  useTape    = input.bool(true, "Require tape proxy (absorption or exhaustion)", group = GRP_S)
+float volMult    = input.float(1.5, "Absorption: volume ≥ average ×", minval = 0.5, step = 0.1, group = GRP_S)
+int   volLen     = input.int(20, "Volume average length", minval = 1, group = GRP_S)
+float wickPct    = input.float(0.5, "Absorption: rejection wick ≥ fraction of bar range", minval = 0.1, maxval = 0.9, step = 0.05, group = GRP_S)
+
+string GRP_R = "5-6 · Trade and exit"
+float minRR      = input.float(1.5, "Minimum distance to VWAP (R)", minval = 0.1, step = 0.1, group = GRP_R)
+float stopBufAtr = input.float(0.1, "Stop buffer beyond sweep (× ATR)", minval = 0.0, step = 0.05, group = GRP_R)
+float reachAtr   = input.float(10.0, "VWAP counts as reachable within (× ATR, 0 = off)", minval = 0.0, step = 0.5, group = GRP_R)
+bool  trailVwap  = input.bool(true, "Target follows live VWAP", group = GRP_R)
+int   stallBars  = input.int(8, "Stall exit: bars after entry", minval = 1, group = GRP_R)
+float stallR     = input.float(0.5, "Stall exit: if best move is under (R)", minval = 0.0, step = 0.1, group = GRP_R)
+
+string GRP_V = "Display"
+bool showZones  = input.bool(true, "Show zones", group = GRP_V)
+bool showLabels = input.bool(true, "Show signal labels", group = GRP_V)
+bool showSkips  = input.bool(true, "Show rejected setups", group = GRP_V)
+bool showTable  = input.bool(true, "Show status table", group = GRP_V)
+bool showTrend  = input.bool(true, "Tint background by trend", group = GRP_V)
+
+color C_LONG  = color.teal
+color C_SHORT = color.red
+color C_MUTED = color.gray
+
+// ───────── Higher-timeframe data (confirmed bars only, no repainting) ─────────
+f_structure(int len) =>
+    var float lastPH = na
+    var float prevPH = na
+    var float lastPL = na
+    var float prevPL = na
+    float ph = ta.pivothigh(high, len, len)
+    float pl = ta.pivotlow(low, len, len)
+    if not na(ph)
+        prevPH := lastPH
+        lastPH := ph
+    if not na(pl)
+        prevPL := lastPL
+        lastPL := pl
+    int dir = 0
+    if not na(prevPH) and not na(prevPL)
+        if lastPH > prevPH and lastPL > prevPL
+            dir := 1
+        else if lastPH < prevPH and lastPL < prevPL
+            dir := -1
+    dir[1]
+
+// Demand zone = candle before the last strong up candle; supply zone = candle before the last strong down candle.
+f_zones(float mult, int atrLen) =>
+    float atr = ta.atr(atrLen)
+    float body = math.abs(close - open)
+    bool up = close > open and body >= mult * atr[1] and close > high[1]
+    bool dn = close < open and body >= mult * atr[1] and close < low[1]
+    var float dTop = na
+    var float dBot = na
+    var int dTime = na
+    var float sTop = na
+    var float sBot = na
+    var int sTime = na
+    if up
+        dTop := high[1]
+        dBot := math.min(low[1], low)
+        dTime := time[1]
+    if dn
+        sTop := math.max(high[1], high)
+        sBot := low[1]
+        sTime := time[1]
+    [dTop[1], dBot[1], dTime[1], sTop[1], sBot[1], sTime[1]]
+
+int trendDir = request.security(syminfo.tickerid, trendTf, f_structure(trendPivot), lookahead = barmerge.lookahead_on)
+[dTop, dBot, dTime, sTop, sBot, sTime] = request.security(syminfo.tickerid, zoneTf, f_zones(impMult, impAtrLen), lookahead = barmerge.lookahead_on)
+float brkClose = request.security(syminfo.tickerid, breakTf, close[1], lookahead = barmerge.lookahead_on)
+
+// ───────── Chart-timeframe data ─────────
+float atr5   = ta.atr(14)
+float volAvg = ta.sma(volume, volLen)
+float vw     = ta.vwap(hlc3)
+float pivH   = ta.pivothigh(high, shiftPivot, shiftPivot)
+float pivL   = ta.pivotlow(low, shiftPivot, shiftPivot)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+if not na(pivH)
+    lastSwingHigh := pivH
+if not na(pivL)
+    lastSwingLow := pivL
+
+// ───────── Setup state ─────────
+type Setup
+    bool  active = false
+    int   zoneId = na
+    bool  tagged = false
+    int   tagBar = na
+    float sweep = na
+    float sweepVol = na
+    bool  tape = false
+    float usedLvl = na
+    bool  inTrade = false
+    float entry = na
+    float stop = na
+    float target = na
+    float risk = na
+    float tradeSweep = na
+    int   entryBar = na
+    float mfe = na
+    box   bx = na
+    line  lEntry = na
+    line  lStop = na
+    line  lTarget = na
+
+f_mark(string txt, bool below, color c) =>
+    if showLabels
+        label.new(bar_index, below ? low : high, txt, yloc = below ? yloc.belowbar : yloc.abovebar, style = below ? label.style_label_up : label.style_label_down, color = c, textcolor = color.white, size = size.small)
+
+// Returns: 0 none, 1 entry, 2 target, 3 stop, 4 close through sweep, 5 stall, 6 zone cancelled, 7 setup rejected.
+f_process(Setup s, int dir, float zTop, float zBot, int zTime, bool trendOk, float swingLvl, float atr, float vAvg, float vwapNow, float brk) =>
+    int sig = 0
+    bool isLong = dir == 1
+    color c = isLong ? C_LONG : C_SHORT
+
+    // New zone replaces the previous one.
+    if not na(zTime) and (na(s.zoneId) or zTime != s.zoneId)
+        s.zoneId := zTime
+        s.active := true
+        s.tagged := false
+        s.tape := false
+        s.sweep := na
+        s.sweepVol := na
+        s.usedLvl := na
+        if showZones
+            s.bx := box.new(zTime, zTop, time, zBot, xloc = xloc.bar_time, border_color = c, bgcolor = color.new(c, 85))
+
+    // A pullback-timeframe close through the zone cancels it.
+    bool broken = isLong ? brk < zBot : brk > zTop
+    if s.active and broken
+        s.active := false
+        s.tagged := false
+        sig := 6
+        if not na(s.bx)
+            box.set_border_color(s.bx, C_MUTED)
+            box.set_bgcolor(s.bx, color.new(C_MUTED, 90))
+    if s.active and not na(s.bx)
+        box.set_right(s.bx, time)
+
+    // Manage an open trade.
+    if s.inTrade
+        if trailVwap and not na(vwapNow)
+            s.target := vwapNow
+            line.set_y1(s.lTarget, vwapNow)
+            line.set_y2(s.lTarget, vwapNow)
+        line.set_x2(s.lEntry, bar_index)
+        line.set_x2(s.lStop, bar_index)
+        line.set_x2(s.lTarget, bar_index)
+        s.mfe := math.max(s.mfe, isLong ? high - s.entry : s.entry - low)
+        bool hitStop = isLong ? low <= s.stop : high >= s.stop
+        bool hitTgt = isLong ? high >= s.target : low <= s.target
+        bool closeInv = isLong ? close < s.tradeSweep : close > s.tradeSweep
+        bool stalled = bar_index - s.entryBar >= stallBars and s.mfe < stallR * s.risk
+        // Stop is checked first when stop and target fall inside the same bar.
+        if hitStop
+            sig := 3
+            f_mark("Stop", not isLong, C_MUTED)
+        else if hitTgt
+            sig := 2
+            f_mark("VWAP hit", not isLong, c)
+        else if closeInv
+            sig := 4
+            f_mark("Exit: closed through sweep", not isLong, C_MUTED)
+        else if stalled
+            sig := 5
+            f_mark("Exit: stalled", not isLong, C_MUTED)
+        if sig >= 2 and sig <= 5
+            s.inTrade := false
+
+    // Look for the trigger.
+    bool live = s.active and trendOk and not s.inTrade
+    bool touch = isLong ? low <= zTop : high >= zBot
+    if not live
+        s.tagged := false
+    if live and not s.tagged and touch
+        s.tagged := true
+        s.tagBar := bar_index
+        s.tape := false
+        if na(s.sweep)
+            s.sweep := isLong ? low : high
+            s.sweepVol := volume
+
+    if s.tagged
+        // Exhaustion: a fresh extreme printed on lighter volume than the previous extreme.
+        bool newExt = isLong ? low < s.sweep : high > s.sweep
+        if newExt
+            if volume < s.sweepVol and volume < vAvg
+                s.tape := true
+            s.sweep := isLong ? low : high
+            s.sweepVol := volume
+        // Absorption: heavy volume at the zone with a rejection wick.
+        float rng = high - low
+        float wick = isLong ? math.min(open, close) - low : high - math.max(open, close)
+        if touch and rng > 0 and volume >= volMult * vAvg and wick >= wickPct * rng
+            s.tape := true
+
+        bool newLvl = not na(swingLvl) and (na(s.usedLvl) or swingLvl != s.usedLvl)
+        bool shift = newLvl and bar_index > s.tagBar and (isLong ? close > swingLvl : close < swingLvl)
+        if shift
+            float stp = isLong ? s.sweep - stopBufAtr * atr : s.sweep + stopBufAtr * atr
+            float rsk = math.abs(close - stp)
+            float reward = dir * (vwapNow - close)
+            bool rrOk = rsk > 0 and reward >= minRR * rsk
+            bool reachOk = reachAtr == 0 or reward <= reachAtr * atr
+            bool tapeOk = not useTape or s.tape
+            s.usedLvl := swingLvl
+            s.tagged := false
+            if rrOk and reachOk and tapeOk
+                sig := 1
+                s.inTrade := true
+                s.entry := close
+                s.stop := stp
+                s.target := vwapNow
+                s.risk := rsk
+                s.tradeSweep := s.sweep
+                s.entryBar := bar_index
+                s.mfe := 0.0
+                s.lEntry := line.new(bar_index, close, bar_index + 1, close, color = c, width = 1)
+                s.lStop := line.new(bar_index, stp, bar_index + 1, stp, color = color.red, style = line.style_dashed, width = 1)
+                s.lTarget := line.new(bar_index, vwapNow, bar_index + 1, vwapNow, color = color.blue, style = line.style_dashed, width = 1)
+                f_mark((isLong ? "BUY" : "SELL") + "\nVWAP " + str.tostring(reward / rsk, "#.##") + "R", isLong, c)
+            else
+                sig := 7
+                if showSkips
+                    string why = (not rrOk ? "VWAP < " + str.tostring(minRR, "#.##") + "R" : "") + (not reachOk ? " VWAP too far" : "") + (not tapeOk ? " no tape" : "")
+                    f_mark("Skip:" + (rrOk ? "" : " ") + why, isLong, C_MUTED)
+    sig
+
+var Setup longS  = Setup.new()
+var Setup shortS = Setup.new()
+
+bool longTrend  = trendDir == 1 and dirMode != "Short only"
+bool shortTrend = trendDir == -1 and dirMode != "Long only"
+
+int sigL = f_process(longS, 1, dTop, dBot, dTime, longTrend, lastSwingHigh, atr5, volAvg, vw, brkClose)
+int sigS = f_process(shortS, -1, sTop, sBot, sTime, shortTrend, lastSwingLow, atr5, volAvg, vw, brkClose)
+
+// ───────── Plots ─────────
+plot(vw, "VWAP", color = color.blue, linewidth = 2)
+bgcolor(showTrend ? (trendDir == 1 ? color.new(C_LONG, 94) : trendDir == -1 ? color.new(C_SHORT, 94) : na) : na, title = "Trend tint")
+plotshape(sigL == 1, "Buy", shape.triangleup, location.belowbar, C_LONG, size = size.small)
+plotshape(sigS == 1, "Sell", shape.triangledown, location.abovebar, C_SHORT, size = size.small)
+
+// ───────── Status table ─────────
+f_state(Setup s, bool trendOk) =>
+    s.inTrade ? "In trade" : not trendOk ? "Stand aside" : not s.active ? "No valid zone" : s.tagged ? (s.tape or not useTape ? "Tagged: wait for shift" : "Tagged: wait for tape + shift") : "Wait for pullback"
+
+var table info = table.new(position.top_right, 2, 4, bgcolor = color.new(color.black, 80), border_width = 1)
+if showTable and barstate.islast
+    string trendTxt = trendDir == 1 ? "Up (HH + HL): buy only" : trendDir == -1 ? "Down (LH + LL): sell only" : "No structure: do not trade"
+    color trendCol = trendDir == 1 ? C_LONG : trendDir == -1 ? C_SHORT : C_MUTED
+    string stateTxt = trendDir == 1 ? f_state(longS, longTrend) : trendDir == -1 ? f_state(shortS, shortTrend) : "Stand aside"
+    float entryRef = trendDir == -1 ? shortS.sweep : longS.sweep
+    float distAtr = atr5 > 0 ? math.abs(vw - close) / atr5 : na
+    bool tfOk = timeframe.in_seconds() < timeframe.in_seconds(zoneTf)
+    table.cell(info, 0, 0, "Trend " + trendTf, text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(info, 1, 0, trendTxt, text_color = trendCol, text_size = size.small, text_halign = text.align_left)
+    table.cell(info, 0, 1, "Setup", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(info, 1, 1, stateTxt, text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(info, 0, 2, "Sweep / VWAP", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(info, 1, 2, (na(entryRef) ? "-" : str.tostring(entryRef, format.mintick)) + " / " + str.tostring(distAtr, "#.#") + " ATR away", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(info, 0, 3, "Chart", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(info, 1, 3, tfOk ? "OK" : "Use a chart below the zone timeframe (5m)", text_color = tfOk ? color.white : color.orange, text_size = size.small, text_halign = text.align_left)
+
+// ───────── Alerts ─────────
+alertcondition(sigL == 1, "Buy setup confirmed", "{{ticker}}: buy setup confirmed - zone tag, structure shift, tape proxy, VWAP target valid")
+alertcondition(sigS == 1, "Sell setup confirmed", "{{ticker}}: sell setup confirmed - zone tag, structure shift, tape proxy, VWAP target valid")
+alertcondition(sigL == 2 or sigS == 2, "VWAP target hit", "{{ticker}}: VWAP target reached")
+alertcondition(sigL == 3 or sigS == 3, "Stop hit", "{{ticker}}: stop hit")
+alertcondition(sigL == 4 or sigS == 4, "Exit: close through sweep", "{{ticker}}: price closed back through the sweep - close the trade")
+alertcondition(sigL == 5 or sigS == 5, "Exit: stalled", "{{ticker}}: trade stalled without approaching VWAP - close the trade")
+alertcondition(sigL == 6 or sigS == 6, "Zone cancelled", "{{ticker}}: price closed through the zone - reassess the trend")
+alertcondition(sigL == 7 or sigS == 7, "Setup rejected", "{{ticker}}: structure shift printed but the setup failed validation")
