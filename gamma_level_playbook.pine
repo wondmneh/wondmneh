@@ -1,0 +1,137 @@
+//@version=6
+// Gamma Level Playbook - a testable scaffold built from the Freddy Sami playbook.
+// TradingView has no options data, so the gamma levels and the regime are typed in by hand
+// each morning from your options-flow source. Run it on an intraday index-futures chart (1-5 min).
+strategy("Gamma Level Playbook", overlay = true, initial_capital = 50000,
+     process_orders_on_close = true, commission_type = strategy.commission.cash_per_contract,
+     commission_value = 2.0, slippage = 1, pyramiding = 0)
+
+// ---------- Inputs ----------
+gRegime = "Regime and levels"
+regime     = input.string("Positive gamma (fade)", "Dealer gamma regime", options = ["Positive gamma (fade)", "Negative gamma (continuation)"], group = gRegime)
+levelSrc   = input.string("Manual", "Level source", options = ["Manual", "Prior-day high/low (backtest proxy)"], group = gRegime,
+     tooltip = "Manual is the playbook method. The proxy is NOT from the book; it only lets the Strategy Tester exercise the rules on history.")
+upperIn    = input.float(0.0, "Upper level (strike above price, 0 = off)", group = gRegime)
+lowerIn    = input.float(0.0, "Lower level (strike below price, 0 = off)", group = gRegime)
+pinIn      = input.float(0.0, "Pin / max-gamma strike (0 = midpoint of the two levels)", group = gRegime)
+flipIn     = input.float(0.0, "Gamma-flip level (negative regime)", group = gRegime)
+validFrom  = input.time(timestamp("2026-01-01T00:00:00"), "Manual levels valid from", group = gRegime,
+     tooltip = "Manual levels are only traded from this date on, so stale levels are not backtested on older days.")
+
+gTime = "Session"
+tz         = input.string("America/New_York", "Exchange time zone", group = gTime)
+openHour   = input.int(9, "Open hour", 0, 23, group = gTime)
+openMinute = input.int(30, "Open minute", 0, 59, group = gTime)
+windowMin  = input.int(120, "Trading window after the open (minutes)", 10, group = gTime)
+
+gRisk = "Risk"
+maxTrades   = input.int(2, "Max trades per day", 1, 2, group = gRisk)
+riskPct     = input.float(0.5, "Risk per trade (% of equity)", 0.05, step = 0.05, group = gRisk)
+atrLen      = input.int(14, "ATR length", 1, group = gRisk)
+stopAtrMult = input.float(0.5, "Stop margin beyond the level (x ATR)", 0.0, step = 0.1, group = gRisk)
+minRR       = input.float(1.0, "Fade: minimum reward/risk to the pin", 0.0, step = 0.1, group = gRisk)
+contRR      = input.float(2.0, "Continuation: target (x risk)", 0.5, step = 0.25, group = gRisk)
+weekLossMax = input.int(2, "Stop for the week after this many losses", 1, group = gRisk)
+
+gSig = "Signal"
+rejBars  = input.int(3, "Fade: bars allowed for the failed break", 1, group = gSig)
+holdBars = input.int(2, "Continuation: closes required beyond the flip", 1, group = gSig)
+
+// ---------- Levels ----------
+[pdh, pdl] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+manual   = levelSrc == "Manual"
+liveOk   = manual ? time >= validFrom : true
+upper    = manual ? (upperIn > 0 ? upperIn : na) : pdh
+lower    = manual ? (lowerIn > 0 ? lowerIn : na) : pdl
+pin      = manual ? (pinIn > 0 ? pinIn : (upper + lower) / 2) : (pdh + pdl) / 2
+flip     = manual ? (flipIn > 0 ? flipIn : na) : (pdh + pdl) / 2
+positive = regime == "Positive gamma (fade)"
+
+// ---------- Time window ----------
+openMins = openHour * 60 + openMinute
+endMins  = openMins + windowMin
+barMins  = hour(time, tz) * 60 + minute(time, tz)
+closeHM  = hour(time_close, tz) * 60 + minute(time_close, tz)
+inWin    = timeframe.isintraday and barMins >= openMins and barMins < endMins
+lastBar  = inWin and closeHM >= endMins
+
+// ---------- Loss discipline ----------
+var int  tradesToday = 0
+var bool lossToday   = false
+var int  weekLosses  = 0
+if dayofmonth(time, tz) != dayofmonth(time[1], tz)
+    tradesToday := 0
+    lossToday   := false
+if weekofyear(time, tz) != weekofyear(time[1], tz)
+    weekLosses := 0
+if strategy.closedtrades > strategy.closedtrades[1]
+    if strategy.closedtrades.profit(strategy.closedtrades - 1) < 0
+        lossToday  := true
+        weekLosses += 1
+
+// ---------- Signals ----------
+atr    = ta.atr(atrLen)
+hiN    = ta.highest(high, rejBars)
+loN    = ta.lowest(low, rejBars)
+minClN = ta.lowest(close, holdBars)
+maxClN = ta.highest(close, holdBars)
+sinceUp = ta.barssince(ta.crossover(close, flip))
+sinceDn = ta.barssince(ta.crossunder(close, flip))
+
+canTrade = inWin and not lastBar and liveOk and barstate.isconfirmed and strategy.position_size == 0 and
+     tradesToday < maxTrades and not lossToday and weekLosses < weekLossMax
+
+// Positive gamma: price pokes through the level, fails to hold, closes back inside -> fade to the pin.
+fadeShort = positive and hiN >= upper and close < upper and close < open and close > pin
+fadeLong  = positive and loN <= lower and close > lower and close > open and close < pin
+
+// Negative gamma: price crosses the flip and keeps closing beyond it -> go with the break.
+contLong  = not positive and sinceUp == holdBars - 1 and minClN > flip
+contShort = not positive and sinceDn == holdBars - 1 and maxClN < flip
+
+f_qty(dist) =>
+    math.max(1, math.floor(strategy.equity * riskPct / 100 / (dist * syminfo.pointvalue)))
+
+if canTrade
+    float sl = na
+    float tp = na
+    int   dir = 0
+    if fadeShort
+        sl  := math.max(hiN, upper) + atr * stopAtrMult
+        tp  := pin
+        dir := -1
+    else if fadeLong
+        sl  := math.min(loN, lower) - atr * stopAtrMult
+        tp  := pin
+        dir := 1
+    else if contLong
+        sl  := flip - atr * stopAtrMult
+        tp  := close + (close - sl) * contRR
+        dir := 1
+    else if contShort
+        sl  := flip + atr * stopAtrMult
+        tp  := close - (sl - close) * contRR
+        dir := -1
+
+    risk   = math.abs(close - sl)
+    reward = math.abs(tp - close)
+    rrOk   = positive ? reward >= risk * minRR : true
+    if dir != 0 and risk > 0 and rrOk
+        tradesToday += 1
+        if dir == 1
+            strategy.entry("Long", strategy.long, qty = f_qty(risk), alert_message = "BUY " + syminfo.ticker + " stop " + str.tostring(sl, format.mintick) + " target " + str.tostring(tp, format.mintick))
+            strategy.exit("Long exit", "Long", stop = sl, limit = tp, alert_message = "EXIT LONG " + syminfo.ticker)
+        else
+            strategy.entry("Short", strategy.short, qty = f_qty(risk), alert_message = "SELL " + syminfo.ticker + " stop " + str.tostring(sl, format.mintick) + " target " + str.tostring(tp, format.mintick))
+            strategy.exit("Short exit", "Short", stop = sl, limit = tp, alert_message = "EXIT SHORT " + syminfo.ticker)
+
+// Time stop: flat when the window ends.
+if strategy.position_size != 0 and (lastBar or not inWin)
+    strategy.close_all(comment = "Window end", alert_message = "CLOSE ALL " + syminfo.ticker + " - window ended")
+
+// ---------- Visuals ----------
+plot(positive ? upper : na, "Upper level", color.red, 2, plot.style_linebr)
+plot(positive ? lower : na, "Lower level", color.green, 2, plot.style_linebr)
+plot(positive ? pin : na, "Pin / midpoint", color.gray, 1, plot.style_linebr)
+plot(positive ? na : flip, "Gamma flip", color.orange, 2, plot.style_linebr)
+bgcolor(inWin ? color.new(color.blue, 92) : na, title = "Trading window")
