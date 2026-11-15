@@ -1,0 +1,247 @@
+//@version=6
+// Scalping Signal Indicator - non-repainting.
+// Every signal, trade and statistic is evaluated only once a bar has closed,
+// no higher-timeframe data is requested, and nothing looks ahead. A label that
+// has printed never moves or disappears.
+indicator("Scalping Signal Indicator [Non-Repaint]", shorttitle = "Scalp NR", overlay = true, max_labels_count = 500, max_lines_count = 500)
+
+// ───────────────────────── Inputs ─────────────────────────
+const string G_SIG = "Signal engine"
+float  srcIn      = input.source(close, "Source", group = G_SIG)
+string maType     = input.string("ALMA", "Smoothing", options = ["None", "ALMA", "EMA", "SMA", "WMA", "HMA"], group = G_SIG)
+int    maLen      = input.int(5, "Smoothing length", minval = 2, group = G_SIG)
+float  almaOffset = input.float(0.85, "ALMA offset", minval = 0.0, maxval = 1.0, step = 0.05, group = G_SIG)
+float  almaSigma  = input.float(6.0, "ALMA sigma", minval = 1.0, step = 0.5, group = G_SIG)
+int    atrLen     = input.int(18, "ATR length", minval = 1, group = G_SIG)
+float  atrMult    = input.float(2.0, "ATR multiplier", minval = 0.1, step = 0.1, tooltip = "Higher = fewer, slower signals. Lower = more, faster signals.", group = G_SIG)
+
+const string G_FLT = "Entry filters (exits are never filtered)"
+bool  useEma = input.bool(false, "Trend EMA filter", inline = "ema", group = G_FLT)
+int   emaLen = input.int(200, "", minval = 1, inline = "ema", group = G_FLT)
+bool  useRsi = input.bool(false, "RSI filter", tooltip = "Skip buys when RSI is overbought and sells when RSI is oversold.", group = G_FLT)
+int   rsiLen = input.int(14, "RSI length", minval = 1, group = G_FLT)
+float rsiOB  = input.float(70, "Overbought", group = G_FLT)
+float rsiOS  = input.float(30, "Oversold", group = G_FLT)
+bool  useAdx = input.bool(false, "ADX filter", tooltip = "Only take entries when ADX is above the threshold.", group = G_FLT)
+int   diLen  = input.int(14, "DI length", minval = 1, group = G_FLT)
+int   adxLen = input.int(14, "ADX smoothing", minval = 1, group = G_FLT)
+float adxThr = input.float(25, "ADX threshold", group = G_FLT)
+
+const string G_TRD = "Trades & statistics"
+string tradeDir = input.string("Long only", "Direction", options = ["Both", "Long only", "Short only"], group = G_TRD)
+float  startCap = input.float(5000, "Starting capital", minval = 1, group = G_TRD)
+float  qty      = input.float(1.0, "Quantity (units)", minval = 0.0001, step = 0.1, group = G_TRD)
+bool   useSLTP  = input.bool(false, "Use stop loss / take profit", tooltip = "When off, a trade is closed by the opposite signal only.", group = G_TRD)
+float  slMult   = input.float(1.5, "Stop loss (x ATR)", minval = 0.1, step = 0.1, group = G_TRD)
+float  rrRatio  = input.float(2.0, "Take profit (x risk)", minval = 0.1, step = 0.1, group = G_TRD)
+
+const string G_VIS = "Display"
+bool   showLine  = input.bool(true, "Trend line", group = G_VIS)
+bool   showLvl   = input.bool(true, "Entry level lines", group = G_VIS)
+bool   showStats = input.bool(true, "Statistics table", group = G_VIS)
+bool   showDays  = input.bool(true, "Weekday win-rate table", group = G_VIS)
+bool   colorBars = input.bool(false, "Color bars by trend", group = G_VIS)
+string tblSize   = input.string(size.small, "Table text size", options = [size.tiny, size.small, size.normal], group = G_VIS)
+
+// ───────────────────────── Signal engine ─────────────────────────
+// Every average is computed on every bar so its history stays consistent.
+ma(float s, int len, string t) =>
+    float alma = ta.alma(s, len, almaOffset, almaSigma)
+    float emaV = ta.ema(s, len)
+    float smaV = ta.sma(s, len)
+    float wmaV = ta.wma(s, len)
+    float hmaV = ta.hma(s, len)
+    switch t
+        "ALMA" => alma
+        "EMA"  => emaV
+        "SMA"  => smaV
+        "WMA"  => wmaV
+        "HMA"  => hmaV
+        => s
+
+float src   = ma(srcIn, maLen, maType)
+float atr   = ta.atr(atrLen)
+float nLoss = atrMult * atr
+
+// ATR trailing line: ratchets with price, flips side when price closes through it.
+var float trail = na
+float prevTrail = nz(trail[1], src)
+trail := src > prevTrail and src[1] > prevTrail ? math.max(prevTrail, src - nLoss) : src < prevTrail and src[1] < prevTrail ? math.min(prevTrail, src + nLoss) : src > prevTrail ? src - nLoss : src + nLoss
+
+var int dir = 0
+dir := src > trail ? 1 : src < trail ? -1 : dir
+
+float ema = ta.ema(close, emaLen)
+float rsi = ta.rsi(close, rsiLen)
+[_diPlus, _diMinus, adx] = ta.dmi(diLen, adxLen)
+
+// barstate.isconfirmed is what makes this non-repainting: nothing fires intrabar.
+bool flipUp   = barstate.isconfirmed and dir == 1 and dir[1] == -1
+bool flipDown = barstate.isconfirmed and dir == -1 and dir[1] == 1
+bool adxOk    = not useAdx or adx > adxThr
+bool buySig   = flipUp and adxOk and (not useEma or close > ema) and (not useRsi or rsi < rsiOB)
+bool sellSig  = flipDown and adxOk and (not useEma or close < ema) and (not useRsi or rsi > rsiOS)
+
+// ───────────────────────── Trade tracking ─────────────────────────
+type Stats
+    int        trades   = 0
+    int        wins     = 0
+    int        losses   = 0
+    float      grossWin = 0.0
+    float      grossLoss = 0.0
+    float      equity   = 0.0
+    float      peak     = 0.0
+    float      trough   = 0.0
+    float      maxDD    = 0.0
+    float      maxRunup = 0.0
+    array<int> dayWins
+    array<int> dayLosses
+
+method record(Stats s, float pnl, int dayIdx) =>
+    s.trades += 1
+    if pnl > 0
+        s.wins += 1
+        s.grossWin += pnl
+        s.dayWins.set(dayIdx, s.dayWins.get(dayIdx) + 1)
+    else
+        s.losses += 1
+        s.grossLoss += math.abs(pnl)
+        s.dayLosses.set(dayIdx, s.dayLosses.get(dayIdx) + 1)
+    s.equity += pnl
+    s.peak := math.max(s.peak, s.equity)
+    s.trough := math.min(s.trough, s.equity)
+    s.maxDD := math.max(s.maxDD, (s.peak - s.equity) / s.peak * 100)
+    s.maxRunup := math.max(s.maxRunup, s.equity - s.trough)
+    s
+
+var Stats st = Stats.new(equity = startCap, peak = startCap, trough = startCap, dayWins = array.new<int>(7, 0), dayLosses = array.new<int>(7, 0))
+
+var int   pos        = 0
+var float entryPrice = na
+var int   entryDay   = 0
+var float slPrice    = na
+var float tpPrice    = na
+var line  entryLine  = na
+
+bool allowLong  = tradeDir != "Short only"
+bool allowShort = tradeDir != "Long only"
+
+bool   longEntry  = false
+bool   shortEntry = false
+bool   exitEvent  = false
+float  closedPnl  = na
+int    closedDir  = 0
+string exitReason = ""
+
+if barstate.isconfirmed
+    float exitPrice = na
+    // Stop / target on a position opened on an earlier bar. If both are touched
+    // in the same bar the stop is assumed first (conservative).
+    if pos != 0 and useSLTP
+        bool slHit = pos == 1 ? low <= slPrice : high >= slPrice
+        bool tpHit = pos == 1 ? high >= tpPrice : low <= tpPrice
+        if slHit
+            exitPrice := pos == 1 ? math.min(open, slPrice) : math.max(open, slPrice)
+            exitReason := "SL"
+        else if tpHit
+            exitPrice := pos == 1 ? math.max(open, tpPrice) : math.min(open, tpPrice)
+            exitReason := "TP"
+    // Opposite trend flip closes the trade at the bar's close.
+    if na(exitPrice) and ((pos == 1 and flipDown) or (pos == -1 and flipUp))
+        exitPrice := close
+        exitReason := "Exit"
+    if not na(exitPrice)
+        closedPnl := (exitPrice - entryPrice) * pos * qty
+        closedDir := pos
+        st.record(closedPnl, entryDay)
+        exitEvent := true
+        pos := 0
+        entryPrice := na
+        slPrice := na
+        tpPrice := na
+
+    if pos == 0 and ((buySig and allowLong) or (sellSig and allowShort))
+        pos := buySig ? 1 : -1
+        longEntry := pos == 1
+        shortEntry := pos == -1
+        entryPrice := close
+        entryDay := dayofweek(time) - 1
+        if useSLTP
+            slPrice := entryPrice - pos * slMult * atr
+            tpPrice := entryPrice + pos * slMult * rrRatio * atr
+        if showLvl
+            entryLine := line.new(bar_index, entryPrice, bar_index + 1, entryPrice, color = pos == 1 ? color.green : color.red, style = line.style_dotted, width = 2)
+
+    string pnlTxt = na(closedPnl) ? "" : (closedPnl >= 0 ? "+" : "") + str.tostring(closedPnl, "#.##")
+    if longEntry
+        label.new(bar_index, low, "BUY", yloc = yloc.belowbar, style = label.style_label_up, color = color.green, textcolor = color.white, size = size.small, tooltip = "Long @ " + str.tostring(close, format.mintick) + (exitEvent ? "\nClosed short: " + pnlTxt : ""))
+    else if shortEntry
+        label.new(bar_index, high, "SELL", yloc = yloc.abovebar, style = label.style_label_down, color = color.red, textcolor = color.white, size = size.small, tooltip = "Short @ " + str.tostring(close, format.mintick) + (exitEvent ? "\nClosed long: " + pnlTxt : ""))
+    else if exitEvent
+        bool wasLong = closedDir == 1
+        label.new(bar_index, high, exitReason + "\n" + pnlTxt, yloc = wasLong ? yloc.abovebar : yloc.belowbar, style = wasLong ? label.style_label_down : label.style_label_up, color = closedPnl >= 0 ? color.teal : color.maroon, textcolor = color.white, size = size.small)
+
+if showLvl and pos != 0 and not longEntry and not shortEntry and not na(entryLine)
+    entryLine.set_x2(bar_index)
+
+// ───────────────────────── Plots ─────────────────────────
+color trendCol = dir == 1 ? color.lime : dir == -1 ? color.red : color.gray
+plot(showLine ? trail : na, "Trend line", color = trendCol, linewidth = 2)
+plot(useSLTP and pos != 0 ? slPrice : na, "Stop loss", color = color.red, style = plot.style_linebr)
+plot(useSLTP and pos != 0 ? tpPrice : na, "Take profit", color = color.green, style = plot.style_linebr)
+barcolor(colorBars ? trendCol : na)
+
+// ───────────────────────── Tables ─────────────────────────
+cell(table t, int c, int r, string txt, color bg) =>
+    table.cell(t, c, r, txt, text_color = color.white, bgcolor = bg, text_size = tblSize)
+
+var table statsTbl = table.new(position.top_right, 5, 3, border_width = 1)
+var table daysTbl  = table.new(position.top_left, 8, 4, border_width = 1)
+
+if barstate.islast
+    color navy   = color.rgb(20, 60, 110)
+    color good   = color.rgb(60, 160, 40)
+    color bad    = color.rgb(200, 40, 40)
+    float winPct = st.trades > 0 ? 100.0 * st.wins / st.trades : 0.0
+    float retPct = (st.equity - startCap) / startCap * 100
+    float openPL = pos != 0 ? (close - entryPrice) * pos * qty : 0.0
+    if showStats
+        string pf = st.grossLoss > 0 ? str.tostring(st.grossWin / st.grossLoss, "#.##") : st.grossWin > 0 ? "∞" : "-"
+        cell(statsTbl, 0, 0, "Total Trades:\n" + str.tostring(st.trades), navy)
+        cell(statsTbl, 1, 0, "Starting:\n" + str.tostring(startCap, "#.##"), navy)
+        cell(statsTbl, 2, 0, "Avg Win:\n" + (st.wins > 0 ? str.tostring(st.grossWin / st.wins, "#.##") : "-"), navy)
+        cell(statsTbl, 3, 0, "Profit Factor:\n" + pf, good)
+        cell(statsTbl, 4, 0, "Return:\n" + (retPct >= 0 ? "+" : "") + str.tostring(retPct, "#.##") + "%", retPct >= 0 ? good : bad)
+        cell(statsTbl, 0, 1, "Win Rate:\n" + str.tostring(winPct, "#.##") + "%", navy)
+        cell(statsTbl, 1, 1, "Ending:\n" + str.tostring(st.equity, "#.##"), navy)
+        cell(statsTbl, 2, 1, "Avg Loss:\n" + (st.losses > 0 ? str.tostring(st.grossLoss / st.losses, "#.##") : "-"), navy)
+        cell(statsTbl, 3, 1, "Max Runup:\n" + str.tostring(st.maxRunup, "#.##"), navy)
+        cell(statsTbl, 4, 1, "Max DD:\n" + str.tostring(st.maxDD, "#.##") + "%", bad)
+        cell(statsTbl, 0, 2, "Position:\n" + (pos == 1 ? "LONG" : pos == -1 ? "SHORT" : "FLAT"), pos == 1 ? good : pos == -1 ? bad : navy)
+        cell(statsTbl, 1, 2, "Entry:\n" + (pos != 0 ? str.tostring(entryPrice, format.mintick) : "-"), navy)
+        cell(statsTbl, 2, 2, "Open P/L:\n" + (pos != 0 ? str.tostring(openPL, "#.##") : "-"), pos == 0 ? navy : openPL >= 0 ? good : bad)
+        cell(statsTbl, 3, 2, "Trend:\n" + (dir == 1 ? "UP" : dir == -1 ? "DOWN" : "-"), dir == 1 ? good : dir == -1 ? bad : navy)
+        cell(statsTbl, 4, 2, "Signals:\nbar close", navy)
+    if showDays
+        array<string> names = array.from("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
+        color hdr  = color.rgb(40, 110, 200)
+        color body = color.rgb(10, 40, 160)
+        cell(daysTbl, 0, 0, "Day", hdr)
+        cell(daysTbl, 0, 1, "Win", body)
+        cell(daysTbl, 0, 2, "Loss", hdr)
+        cell(daysTbl, 0, 3, "Win Rate", body)
+        for i = 0 to 6
+            int w = st.dayWins.get(i)
+            int l = st.dayLosses.get(i)
+            cell(daysTbl, i + 1, 0, names.get(i), hdr)
+            cell(daysTbl, i + 1, 1, str.tostring(w), body)
+            cell(daysTbl, i + 1, 2, str.tostring(l), hdr)
+            cell(daysTbl, i + 1, 3, w + l > 0 ? str.tostring(math.round(100.0 * w / (w + l))) + " %" : "-", body)
+
+// ───────────────────────── Alerts ─────────────────────────
+// Conditions are only ever true on a closed bar, so "Once Per Bar Close" and
+// "Once Per Bar" behave the same and never fire on a signal that later vanishes.
+alertcondition(longEntry, "Buy signal", "{{ticker}} {{interval}}: BUY at {{close}}")
+alertcondition(shortEntry, "Sell signal", "{{ticker}} {{interval}}: SELL at {{close}}")
+alertcondition(exitEvent and not longEntry and not shortEntry, "Exit signal", "{{ticker}} {{interval}}: EXIT at {{close}}")
+alertcondition(longEntry or shortEntry or exitEvent, "Any signal", "{{ticker}} {{interval}}: signal at {{close}}")
