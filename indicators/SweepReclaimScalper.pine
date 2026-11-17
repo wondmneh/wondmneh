@@ -1,0 +1,53 @@
+//@version=5
+// Marks failed breakouts (liquidity sweeps) of the recent range, but only when
+// volatility is active and trading costs are small relative to it.
+// Signals are set on closed bars only and never repaint.
+indicator("Sweep Reclaim Scalper", shorttitle="SweepReclaim", overlay=true)
+
+grpSweep = "Sweep detection"
+lookback    = input.int(20, "Bars that define the range being swept", minval=2, group=grpSweep)
+minSweepATR = input.float(0.10, "Minimum push beyond the range, in ATRs", minval=0.0, step=0.05, group=grpSweep)
+minWick     = input.float(0.50, "Rejection wick as a share of the bar's range", minval=0.0, maxval=1.0, step=0.05, group=grpSweep)
+
+grpFilter = "Volatility and cost filters"
+atrLen      = input.int(14, "Fast ATR period", minval=1, group=grpFilter)
+atrSlowLen  = input.int(100, "Slow ATR period (baseline volatility)", minval=1, group=grpFilter)
+minVolRatio = input.float(1.00, "Minimum fast ATR / slow ATR (0 = off)", minval=0.0, step=0.05, group=grpFilter)
+// TradingView has no historical spread data, so the spread is supplied by the user
+spreadCost  = input.float(0.0, "Your typical spread, in price units (0 = off)", minval=0.0, group=grpFilter)
+maxCostATR  = input.float(0.15, "Maximum spread as a share of fast ATR", minval=0.0, step=0.01, group=grpFilter)
+
+grpSession = "Session filter"
+useSession = input.bool(true, "Only signal inside the session window", group=grpSession)
+sessionStr = input.session("0700-1700:1234567", "Session", group=grpSession)
+sessionTz  = input.string("UTC", "Session time zone", group=grpSession)
+
+atrFast = ta.atr(atrLen)
+atrSlow = ta.atr(atrSlowLen)
+
+// Range of the previous bars, excluding the current one
+rangeHigh = ta.highest(high, lookback)[1]
+rangeLow  = ta.lowest(low, lookback)[1]
+
+barRange  = high - low
+lowerWick = math.min(open, close) - low
+upperWick = high - math.max(open, close)
+
+inSession = not useSession or not na(time(timeframe.period, sessionStr, sessionTz))
+volOk     = minVolRatio == 0.0 or atrFast / atrSlow >= minVolRatio
+costOk    = spreadCost == 0.0 or spreadCost <= maxCostATR * atrFast
+filtersOk = inSession and volOk and costOk and barRange > 0 and barstate.isconfirmed
+
+sweptLow  = low < rangeLow - minSweepATR * atrFast and close > rangeLow
+sweptHigh = high > rangeHigh + minSweepATR * atrFast and close < rangeHigh
+
+buySignal  = filtersOk and sweptLow and not sweptHigh and lowerWick / barRange >= minWick
+sellSignal = filtersOk and sweptHigh and not sweptLow and upperWick / barRange >= minWick
+
+plot(rangeHigh, "Range high", color=color.new(color.gray, 40), style=plot.style_stepline)
+plot(rangeLow, "Range low", color=color.new(color.gray, 40), style=plot.style_stepline)
+plotshape(buySignal, "Buy (low swept and reclaimed)", style=shape.triangleup, location=location.belowbar, color=color.blue, size=size.small)
+plotshape(sellSignal, "Sell (high swept and rejected)", style=shape.triangledown, location=location.abovebar, color=color.orange, size=size.small)
+
+alertcondition(buySignal, "Low swept and reclaimed", "{{ticker}} {{interval}}: low swept and reclaimed (buy setup)")
+alertcondition(sellSignal, "High swept and rejected", "{{ticker}} {{interval}}: high swept and rejected (sell setup)")
