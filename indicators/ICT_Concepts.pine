@@ -65,6 +65,15 @@ string smtSym = input.symbol("", "Correlated symbol", group = G_SMT)
 bool   smtInv = input.bool(false, "Symbol is inversely correlated", group = G_SMT)
 color  smtCol = input.color(color.fuchsia, "SMT", group = G_SMT)
 
+string G_SIG = "Buy / Sell signals"
+bool showSignals = input.bool(true, "Show BUY / SELL signals", group = G_SIG)
+bool sigFVG      = input.bool(true, "Signal on return to a fair value gap", group = G_SIG)
+bool sigOB       = input.bool(true, "Signal on return to an order block", group = G_SIG)
+bool sigBrk      = input.bool(true, "Signal on return to a breaker / mitigation block", group = G_SIG)
+bool sigPD       = input.bool(true, "Buy only in discount, sell only in premium", group = G_SIG)
+bool sigKZ       = input.bool(false, "Only inside the killzones switched on above", group = G_SIG)
+bool sigPo3      = input.bool(false, "Buy only at/below the 12am open, sell at/above", group = G_SIG)
+
 string NY_TZ    = "America/New_York"
 int    EXTEND   = 5      // bars that live zones reach past the current bar
 int    MAX_BACK = 900    // furthest bar a block search may look back
@@ -76,6 +85,7 @@ type Zone
     bool  bull
     float top
     float bot
+    bool  tapped = false
 
 type Liq
     line  ln
@@ -106,12 +116,22 @@ addZone(array<Zone> arr, int maxN, int leftIdx, float top, float bot, bool bull,
         box.delete(old.bx)
         line.delete(old.mid)
 
-// A zone ends when a candle closes through it.
+// A zone ends when a candle closes through it. Returns whether price returned to a
+// bullish / bearish zone for the first time on this bar and held it.
 updateZones(array<Zone> arr) =>
+    bool bullTap = false
+    bool bearTap = false
     if arr.size() > 0
         for i = arr.size() - 1 to 0
             Zone z = arr.get(i)
             bool dead = z.bull ? close < z.bot : close > z.top
+            bool touched = z.bull ? low <= z.top : high >= z.bot
+            if not dead and touched and not z.tapped
+                z.tapped := true
+                if z.bull
+                    bullTap := true
+                if not z.bull
+                    bearTap := true
             if dead
                 arr.remove(i)
                 box.set_right(z.bx, bar_index)
@@ -119,9 +139,10 @@ updateZones(array<Zone> arr) =>
                 if not keepInvalidated
                     box.delete(z.bx)
                     line.delete(z.mid)
-            else
+            if not dead
                 box.set_right(z.bx, bar_index + EXTEND)
                 line.set_x2(z.mid, bar_index + EXTEND)
+    [bullTap, bearTap]
 
 // ---------------------------------------------------------------- Liquidity
 addLiq(array<Liq> arr, int idx, float price, bool isHigh) =>
@@ -226,11 +247,16 @@ var bool  loBroken = true
 var float otherAtHigh = na
 var float otherAtLow  = na
 
+bool buyTap = false
+bool sellTap = false
+
 if barstate.isconfirmed
-    updateZones(fvgZones)
-    updateZones(obZones)
-    updateZones(brkZones)
-    updateZones(mbZones)
+    [fvgBuy, fvgSell] = updateZones(fvgZones)
+    [obBuy, obSell]   = updateZones(obZones)
+    [brkBuy, brkSell] = updateZones(brkZones)
+    [mbBuy, mbSell]   = updateZones(mbZones)
+    buyTap  := (sigFVG and fvgBuy) or (sigOB and obBuy) or (sigBrk and (brkBuy or mbBuy))
+    sellTap := (sigFVG and fvgSell) or (sigOB and obSell) or (sigBrk and (brkSell or mbSell))
     updateLiq(bslLevels, true)
     updateLiq(sslLevels, false)
 
@@ -340,19 +366,24 @@ killzone(bool show, string sess, string name, color c) =>
         box.set_right(b, bar_index)
         box.set_top(b, math.max(high, box.get_top(b)))
         box.set_bottom(b, math.min(low, box.get_bottom(b)))
+    inside
 
-killzone(showAsia,   "2000-0000", "Asia",         color.gray)
-killzone(showLondon, "0200-0500", "London",       color.blue)
-killzone(showNY,     "0700-1000", "New York",     color.green)
-killzone(showLC,     "1000-1200", "London Close", color.orange)
-killzone(showAM,     "0830-1200", "AM Session",   color.green)
-killzone(showPM,     "1330-1600", "PM Session",   color.purple)
+bool kzAsia   = killzone(showAsia,   "2000-0000", "Asia",         color.gray)
+bool kzLondon = killzone(showLondon, "0200-0500", "London",       color.blue)
+bool kzNY     = killzone(showNY,     "0700-1000", "New York",     color.green)
+bool kzLC     = killzone(showLC,     "1000-1200", "London Close", color.orange)
+bool kzAM     = killzone(showAM,     "0830-1200", "AM Session",   color.green)
+bool kzPM     = killzone(showPM,     "1330-1600", "PM Session",   color.purple)
+bool inKillzone = kzAsia or kzLondon or kzNY or kzLC or kzAM or kzPM
 
 // ---------------------------------------------------------------- Midnight open (Power of 3)
 // Buy at or below the 12am New York open on a buy day, sell at or above it on a sell day.
 var array<line> mnoLines = array.new<line>()
 var label mnoLabel = na
 bool isMidnight = hour(time, NY_TZ) == 0 and minute(time, NY_TZ) == 0
+var float mnoPrice = na
+if isMidnight
+    mnoPrice := open
 if showMNO and intradayOK
     if isMidnight
         mnoLines.push(line.new(bar_index, open, bar_index + 1, open, color = mnoCol, style = line.style_dotted))
@@ -363,3 +394,22 @@ if showMNO and intradayOK
     if not isMidnight and mnoLines.size() > 0
         line.set_x2(mnoLines.last(), bar_index + 1)
         label.set_x(mnoLabel, bar_index + 1)
+
+// ---------------------------------------------------------------- Buy / sell signals
+// A signal prints when a candle returns to a live PD array for the first time and closes
+// without breaking it: buys from bullish arrays in discount, sells from bearish arrays in premium.
+float rangeEq = (rangeHi + rangeLo) / 2
+bool pdBuyOK   = not sigPD or na(rangeEq) or close < rangeEq
+bool pdSellOK  = not sigPD or na(rangeEq) or close > rangeEq
+bool kzOK      = not sigKZ or inKillzone
+bool po3BuyOK  = not sigPo3 or na(mnoPrice) or close <= mnoPrice
+bool po3SellOK = not sigPo3 or na(mnoPrice) or close >= mnoPrice
+
+bool buySignal  = showSignals and buyTap and pdBuyOK and kzOK and po3BuyOK
+bool sellSignal = showSignals and sellTap and pdSellOK and kzOK and po3SellOK
+
+plotshape(buySignal, "Buy", shape.labelup, location.belowbar, color.new(color.green, 0), text = "BUY", textcolor = color.white, size = size.small)
+plotshape(sellSignal, "Sell", shape.labeldown, location.abovebar, color.new(color.red, 0), text = "SELL", textcolor = color.white, size = size.small)
+
+alertcondition(buySignal, "ICT Buy", "ICT buy: price returned to a bullish PD array")
+alertcondition(sellSignal, "ICT Sell", "ICT sell: price returned to a bearish PD array")

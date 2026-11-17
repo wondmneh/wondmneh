@@ -25,6 +25,10 @@
 - **Mitigation block**: the same, when price failed to run that liquidity first (lower high then break of the low, or the reverse).
 - Zones disappear once a candle closes through them, unless `Keep zones that price has closed through` is on.
 
+## Buy / sell signals (TradingView only)
+
+`BUY` prints when a candle returns to a live bullish zone (BISI, +OB, +BRK, +MB) for the first time and closes without breaking it; `SELL` is the mirror for bearish zones. By default buys are only taken in the discount half of the dealing range and sells in the premium half. Optional filters restrict signals to the enabled killzones and to the correct side of the 12am New York open. Signals appear when the candle closes, and both have alert conditions.
+
 ## MT5 setup
 
 1. Copy `ICT_Concepts.mq5` to `MQL5/Indicators` and compile it in MetaEditor.
