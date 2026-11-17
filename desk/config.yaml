@@ -1,0 +1,14 @@
+mode: paper            # paper | live. Live also needs DESK_GO_LIVE=yes and is not wired into run.py yet.
+exchange: okx
+champion: donchian_trend   # which book would trade real money; PROVISIONAL, not cleared for live
+books:                 # each book is an independent $10,000 paper account, named after its strategy
+  donchian_trend: {strategy: donchian_trend, params: {n: 60, k: 2.0}}
+  ema_cross: {strategy: ema_cross, params: {fast: 50, slow: 200}}
+  tsmom: {strategy: tsmom, params: {lb: 14, k: 3.0}}
+risk: {equity: 10000, risk_per_trade: 0.005, max_pos_lev: 1.0, max_gross_lev: 3.0, max_positions: 8}
+costs: {fee: 0.0005, slip_major: 0.0002, slip_alt: 0.0005}
+guard: {day_loss: 0.03, max_streak: 3, halt_bars: 24}
+feed: {poll_seconds: 20, stale_seconds: 180}
+# Books are replayed from this bar on every cycle, so changing a book's params rewrites
+# its history. To change params, add a new book instead.
+paper_start: "2026-11-17T18:00:00Z"
