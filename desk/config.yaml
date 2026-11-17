@@ -1,0 +1,11 @@
+mode: paper            # paper | live
+exchange: okx
+books:                 # each book is an independent paper account
+  champion:    {strategy: donchian_trend, params: {n: 40, k: 2.0}}
+  challenger_1: {strategy: squeeze_breakout, params: {q: 0.25, k: 2.0}}
+  challenger_2: {strategy: trend_pullback, params: {lo: 40, k: 2.0}}
+risk: {equity: 10000, risk_per_trade: 0.005, max_pos_lev: 1.0, max_gross_lev: 3.0, max_positions: 8}
+costs: {fee: 0.0005, slip_major: 0.0002, slip_alt: 0.0005}
+guard: {day_loss: 0.03, max_streak: 3, halt_bars: 24}
+feed: {poll_seconds: 20, stale_seconds: 180}
+paper_start: null      # set automatically on first run (persisted in state/paper_start.json)

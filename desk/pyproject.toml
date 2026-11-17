@@ -1,0 +1,18 @@
+[project]
+name = "desk"
+version = "0.1.0"
+description = "Crypto research desk: data, backtests, paper-trading bot"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "pyarrow>=17",
+    "numba>=0.60",
+    "requests>=2.32",
+    "pyyaml>=6",
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
