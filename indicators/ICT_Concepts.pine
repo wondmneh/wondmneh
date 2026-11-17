@@ -1,9 +1,9 @@
-//@version=5
+//@version=6
 // Chart overlay of the concepts in "The ICT Bible - V1" (Ali Khan): three-bar swings,
 // buyside/sellside liquidity, fair value gaps (BISI/SIBI) with consequent encroachment,
 // order blocks with mean threshold, breaker and mitigation blocks, the dealing range with
 // premium/discount, killzones, the New York midnight open (Power of 3) and SMT divergence.
-indicator("ICT Concepts (ICT Bible V1)", "ICT Concepts", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 1000)
+indicator("ICT Concepts (ICT Bible V1)", "ICT Bible", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 1000)
 
 // ---------------------------------------------------------------- Inputs
 string G_GEN = "General"
@@ -331,10 +331,12 @@ bool intradayOK = timeframe.isintraday and timeframe.in_seconds() <= 3600
 
 killzone(bool show, string sess, string name, color c) =>
     var box b = na
-    bool inside = show and intradayOK and not na(time(timeframe.period, sess, NY_TZ))
-    if inside and not inside[1]
+    bool inSession = not na(time(timeframe.period, sess, NY_TZ))
+    bool inside = show and intradayOK and inSession
+    bool starts = inside and not inside[1]
+    if starts
         b := box.new(bar_index, high, bar_index, low, border_color = color.new(c, 30), bgcolor = color.new(c, 92), text = name, text_color = c, text_size = size.tiny, text_halign = text.align_left, text_valign = text.align_top)
-    else if inside
+    if inside and not starts
         box.set_right(b, bar_index)
         box.set_top(b, math.max(high, box.get_top(b)))
         box.set_bottom(b, math.min(low, box.get_bottom(b)))
@@ -358,6 +360,6 @@ if showMNO and intradayOK
             line.delete(mnoLines.shift())
         label.delete(mnoLabel)
         mnoLabel := label.new(bar_index + 1, open, "12am Open", style = label.style_label_left, color = color.new(mnoCol, 100), textcolor = mnoCol, size = size.tiny)
-    else if mnoLines.size() > 0
+    if not isMidnight and mnoLines.size() > 0
         line.set_x2(mnoLines.last(), bar_index + 1)
         label.set_x(mnoLabel, bar_index + 1)
