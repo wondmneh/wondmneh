@@ -1,0 +1,26 @@
+{
+ "cleared_for_live": false,
+ "books": {
+  "champion": {
+   "strategy": "donchian_trend",
+   "params": {
+    "n": 60,
+    "k": 2.0
+   }
+  },
+  "challenger_1": {
+   "strategy": "ema_cross",
+   "params": {
+    "fast": 50,
+    "slow": 200
+   }
+  },
+  "challenger_2": {
+   "strategy": "tsmom",
+   "params": {
+    "lb": 14,
+    "k": 3.0
+   }
+  }
+ }
+}
