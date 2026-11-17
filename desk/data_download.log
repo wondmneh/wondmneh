@@ -1,0 +1,13 @@
+universe: ['BTC-USDT-SWAP', 'ETH-USDT-SWAP', 'SOL-USDT-SWAP', 'XRP-USDT-SWAP', 'DOGE-USDT-SWAP', 'NEAR-USDT-SWAP', 'UNI-USDT-SWAP', 'AAVE-USDT-SWAP', 'FIL-USDT-SWAP', 'ADA-USDT-SWAP', 'LINK-USDT-SWAP', 'BCH-USDT-SWAP', 'AVAX-USDT-SWAP', 'LTC-USDT-SWAP', 'ICP-USDT-SWAP', 'OP-USDT-SWAP', 'XLM-USDT-SWAP', 'DOT-USDT-SWAP', 'SHIB-USDT-SWAP', 'APT-USDT-SWAP']
+DOGE-USDT-SWAP: 35064 candles, 0 missing, funding okx=277 proxy=4157
+BTC-USDT-SWAP: 35064 candles, 0 missing, funding okx=277 proxy=4157
+SOL-USDT-SWAP: 35064 candles, 0 missing, funding okx=277 proxy=4232
+XRP-USDT-SWAP: 35064 candles, 0 missing, funding okx=277 proxy=4157
+ETH-USDT-SWAP: 35064 candles, 0 missing, funding okx=278 proxy=4156
+NEAR-USDT-SWAP: 35064 candles, 0 missing, funding okx=277 proxy=4157
+UNI-USDT-SWAP: 35064 candles, 0 missing, funding okx=277 proxy=4157
+AAVE-USDT-SWAP: 35064 candles, 0 missing, funding okx=277 proxy=4157
+FIL-USDT-SWAP: 35064 candles, 0 missing, funding okx=278 proxy=4156
+LINK-USDT-SWAP: 35064 candles, 0 missing, funding okx=277 proxy=4157
+BCH-USDT-SWAP: 35064 candles, 0 missing, funding okx=277 proxy=4157
+ADA-USDT-SWAP: 35064 candles, 0 missing, funding okx=277 proxy=4157
