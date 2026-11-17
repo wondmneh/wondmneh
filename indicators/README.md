@@ -1,6 +1,8 @@
-# ICT Concepts (MT5 indicator)
+# ICT Concepts (TradingView and MT5 indicator)
 
-`ICT_Concepts.mq5` overlays the concepts from *The ICT Bible – V1* (Ali Khan) on the chart.
+`ICT_Concepts.pine` (TradingView) and `ICT_Concepts.mq5` (MT5) overlay the concepts from *The ICT Bible – V1* (Ali Khan) on the chart. Both follow the same rules.
+
+**TradingView**: open the Pine Editor, paste the contents of `ICT_Concepts.pine`, then *Add to chart*. Killzones use New York time directly, so there is no broker offset to set.
 
 | Book concept | What is drawn |
 |---|---|
@@ -23,7 +25,7 @@
 - **Mitigation block**: the same, when price failed to run that liquidity first (lower high then break of the low, or the reverse).
 - Zones disappear once a candle closes through them, unless `Keep zones that price has closed through` is on.
 
-## Setup
+## MT5 setup
 
 1. Copy `ICT_Concepts.mq5` to `MQL5/Indicators` and compile it in MetaEditor.
 2. Set `Broker server time minus New York time`. The default of 7 fits brokers on GMT+2 / GMT+3 that follow US daylight saving. Check it against your Market Watch clock, since killzones and the midnight open depend on it.

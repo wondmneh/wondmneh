@@ -1,0 +1,363 @@
+//@version=5
+// Chart overlay of the concepts in "The ICT Bible - V1" (Ali Khan): three-bar swings,
+// buyside/sellside liquidity, fair value gaps (BISI/SIBI) with consequent encroachment,
+// order blocks with mean threshold, breaker and mitigation blocks, the dealing range with
+// premium/discount, killzones, the New York midnight open (Power of 3) and SMT divergence.
+indicator("ICT Concepts (ICT Bible V1)", "ICT Concepts", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 1000)
+
+// ---------------------------------------------------------------- Inputs
+string G_GEN = "General"
+int  swingN          = input.int(1, "Bars each side of a swing (1 = three-bar swing)", minval = 1, maxval = 50, group = G_GEN)
+bool showSwings      = input.bool(true, "Show swing dots", group = G_GEN)
+bool keepInvalidated = input.bool(false, "Keep zones that price has closed through", group = G_GEN)
+
+string G_LIQ = "Liquidity (old highs / lows)"
+bool  showLiq = input.bool(true, "Show BSL / SSL levels", group = G_LIQ)
+int   maxLiq  = input.int(5, "Untaken levels shown per side", minval = 1, maxval = 50, group = G_LIQ)
+color bslCol  = input.color(color.red, "Buyside", group = G_LIQ)
+color sslCol  = input.color(color.blue, "Sellside", group = G_LIQ)
+
+string G_FVG = "Fair Value Gaps"
+bool  showFVG = input.bool(true, "Show FVGs (BISI / SIBI)", group = G_FVG)
+int   maxFVG  = input.int(8, "Most recent FVGs shown", minval = 1, maxval = 100, group = G_FVG)
+float fvgMin  = input.float(0.0, "Minimum gap size (ticks)", minval = 0, group = G_FVG)
+bool  showCE  = input.bool(true, "Show consequent encroachment (50%)", group = G_FVG)
+color bisiCol = input.color(color.teal, "BISI", group = G_FVG)
+color sibiCol = input.color(color.maroon, "SIBI", group = G_FVG)
+
+string G_OB = "Order Blocks"
+bool  showOB    = input.bool(true, "Show order blocks", group = G_OB)
+int   maxOB     = input.int(4, "Most recent order blocks shown", minval = 1, maxval = 50, group = G_OB)
+bool  obSweep   = input.bool(true, "Block must run liquidity past a prior swing", group = G_OB)
+int   blockMax  = input.int(2, "Max consecutive candles merged into a block", minval = 1, maxval = 10, group = G_OB)
+bool  showMT    = input.bool(true, "Show mean threshold (50%)", group = G_OB)
+color bullOBCol = input.color(color.blue, "Bullish OB", group = G_OB)
+color bearOBCol = input.color(color.orange, "Bearish OB", group = G_OB)
+
+string G_BRK = "Breaker / Mitigation Blocks"
+bool  showBrk    = input.bool(true, "Show breaker blocks", group = G_BRK)
+bool  showMB     = input.bool(true, "Show mitigation blocks", group = G_BRK)
+int   maxBrk     = input.int(3, "Most recent shown, per type", minval = 1, maxval = 50, group = G_BRK)
+color bullBrkCol = input.color(color.aqua, "Bullish breaker", group = G_BRK)
+color bearBrkCol = input.color(color.fuchsia, "Bearish breaker", group = G_BRK)
+color bullMBCol  = input.color(color.olive, "Bullish mitigation", group = G_BRK)
+color bearMBCol  = input.color(color.purple, "Bearish mitigation", group = G_BRK)
+
+string G_DR = "Dealing Range (premium / discount)"
+bool  showRange = input.bool(true, "Show current dealing range", group = G_DR)
+int   rangeN    = input.int(10, "Bars each side of a range swing", minval = 2, maxval = 100, group = G_DR)
+color rangeCol  = input.color(color.gray, "Range", group = G_DR)
+
+string G_TIME = "Time (New York)"
+bool  showAsia   = input.bool(true, "FX Asia 8pm-12am", group = G_TIME)
+bool  showLondon = input.bool(true, "FX London 2am-5am", group = G_TIME)
+bool  showNY     = input.bool(true, "FX New York 7am-10am", group = G_TIME)
+bool  showLC     = input.bool(false, "FX London Close 10am-12pm", group = G_TIME)
+bool  showAM     = input.bool(false, "Index AM session 8:30am-12pm", group = G_TIME)
+bool  showPM     = input.bool(false, "Index PM session 1:30pm-4pm", group = G_TIME)
+bool  showMNO    = input.bool(true, "Show 12am New York open (Power of 3)", group = G_TIME)
+int   mnoDays    = input.int(3, "Days of midnight opens shown", minval = 1, maxval = 30, group = G_TIME)
+color mnoCol     = input.color(color.yellow, "Midnight open", group = G_TIME)
+
+string G_SMT = "SMT Divergence"
+bool   useSMT = input.bool(false, "Show SMT divergence", group = G_SMT)
+string smtSym = input.symbol("", "Correlated symbol", group = G_SMT)
+bool   smtInv = input.bool(false, "Symbol is inversely correlated", group = G_SMT)
+color  smtCol = input.color(color.fuchsia, "SMT", group = G_SMT)
+
+string NY_TZ    = "America/New_York"
+int    EXTEND   = 5      // bars that live zones reach past the current bar
+int    MAX_BACK = 900    // furthest bar a block search may look back
+
+// ---------------------------------------------------------------- Types
+type Zone
+    box   bx
+    line  mid
+    bool  bull
+    float top
+    float bot
+
+type Liq
+    line  ln
+    label lb
+    float price
+
+var array<Zone> fvgZones = array.new<Zone>()
+var array<Zone> obZones  = array.new<Zone>()
+var array<Zone> brkZones = array.new<Zone>()
+var array<Zone> mbZones  = array.new<Zone>()
+var array<Liq>  bslLevels = array.new<Liq>()
+var array<Liq>  sslLevels = array.new<Liq>()
+
+// Confirmed swings, newest last.
+var array<float> shP = array.new<float>()
+var array<int>   shI = array.new<int>()
+var array<float> slP = array.new<float>()
+var array<int>   slI = array.new<int>()
+
+// ---------------------------------------------------------------- Zones
+addZone(array<Zone> arr, int maxN, int leftIdx, float top, float bot, bool bull, color c, string txt, bool midline) =>
+    float midP = (top + bot) / 2
+    box b = box.new(leftIdx, top, bar_index + EXTEND, bot, border_color = color.new(c, 40), bgcolor = color.new(c, 80), text = txt, text_color = color.new(c, 0), text_size = size.tiny, text_halign = text.align_left, text_valign = text.align_top)
+    line l = midline ? line.new(leftIdx, midP, bar_index + EXTEND, midP, color = color.new(c, 20), style = line.style_dotted) : na
+    arr.push(Zone.new(b, l, bull, top, bot))
+    if arr.size() > maxN
+        Zone old = arr.shift()
+        box.delete(old.bx)
+        line.delete(old.mid)
+
+// A zone ends when a candle closes through it.
+updateZones(array<Zone> arr) =>
+    if arr.size() > 0
+        for i = arr.size() - 1 to 0
+            Zone z = arr.get(i)
+            bool dead = z.bull ? close < z.bot : close > z.top
+            if dead
+                arr.remove(i)
+                box.set_right(z.bx, bar_index)
+                line.set_x2(z.mid, bar_index)
+                if not keepInvalidated
+                    box.delete(z.bx)
+                    line.delete(z.mid)
+            else
+                box.set_right(z.bx, bar_index + EXTEND)
+                line.set_x2(z.mid, bar_index + EXTEND)
+
+// ---------------------------------------------------------------- Liquidity
+addLiq(array<Liq> arr, int idx, float price, bool isHigh) =>
+    color c = isHigh ? bslCol : sslCol
+    line ln = line.new(idx, price, bar_index + EXTEND, price, color = c, style = line.style_dotted)
+    label lb = label.new(bar_index + EXTEND, price, isHigh ? "BSL" : "SSL", style = isHigh ? label.style_label_lower_left : label.style_label_upper_left, color = color.new(c, 100), textcolor = c, size = size.tiny)
+    arr.push(Liq.new(ln, lb, price))
+    if arr.size() > maxLiq
+        Liq old = arr.shift()
+        line.delete(old.ln)
+        label.delete(old.lb)
+
+// Old highs and lows hold liquidity until price trades through them.
+updateLiq(array<Liq> arr, bool isHigh) =>
+    if arr.size() > 0
+        for i = arr.size() - 1 to 0
+            Liq q = arr.get(i)
+            bool taken = isHigh ? high > q.price : low < q.price
+            if taken
+                arr.remove(i)
+                line.delete(q.ln)
+                label.delete(q.lb)
+            else
+                line.set_x2(q.ln, bar_index + EXTEND)
+                label.set_x(q.lb, bar_index + EXTEND)
+
+// ---------------------------------------------------------------- Blocks
+// Latest swing in the given list that formed before bar `before`.
+prevSwing(array<int> idxArr, array<float> priceArr, int before) =>
+    float p = na
+    int ix = na
+    if idxArr.size() > 0
+        for i = idxArr.size() - 1 to 0
+            if idxArr.get(i) < before
+                p := priceArr.get(i)
+                ix := idxArr.get(i)
+                break
+    [p, ix]
+
+// Last opposing candle(s), scanning back from offset `fromOff` no further than `limitOff`.
+findBlock(int fromOff, int limitOff, bool wantDown) =>
+    int c = fromOff
+    while c <= limitOff and not (wantDown ? close[c] < open[c] : close[c] > open[c])
+        c += 1
+    bool found = c <= limitOff
+    int at = c
+    float top = na
+    float bot = na
+    if found
+        top := high[c]
+        bot := low[c]
+        int merged = 1
+        while merged < blockMax and at + 1 <= limitOff and (wantDown ? close[at + 1] < open[at + 1] : close[at + 1] > open[at + 1])
+            at += 1
+            top := math.max(top, high[at])
+            bot := math.min(bot, low[at])
+            merged += 1
+    [found, at, top, bot]
+
+// A close through a swing confirms the order block that started the move and turns
+// the broken swing into a breaker (liquidity was run first) or a mitigation block.
+onBreak(bool up, int swingIdx) =>
+    int span = math.min(bar_index - swingIdx, MAX_BACK)
+    int m = 0
+    if span > 1
+        for o = 1 to span - 1
+            if (up ? low[o] < low[m] : high[o] > high[m])
+                m := o
+    float legExtreme = up ? low[m] : high[m]
+    [priorP, priorI] = prevSwing(up ? slI : shI, up ? slP : shP, swingIdx)
+    bool ranLiquidity = not na(priorP) and (up ? legExtreme < priorP : legExtreme > priorP)
+
+    [obFound, obAt, obTop, obBot] = findBlock(m, span, up)
+    bool obValid = obFound and (up ? close > obTop : close < obBot) and (ranLiquidity or not obSweep)
+    if showOB and obValid
+        addZone(obZones, maxOB, bar_index - obAt, obTop, obBot, up, up ? bullOBCol : bearOBCol, up ? "+OB" : "-OB", showMT)
+
+    if not na(priorI)
+        int lim = math.min(bar_index - priorI, MAX_BACK)
+        [bkFound, bkAt, bkTop, bkBot] = findBlock(span, lim, not up)
+        if bkFound and ranLiquidity and showBrk
+            addZone(brkZones, maxBrk, bar_index - bkAt, bkTop, bkBot, up, up ? bullBrkCol : bearBrkCol, up ? "+BRK" : "-BRK", false)
+        if bkFound and not ranLiquidity and showMB
+            addZone(mbZones, maxBrk, bar_index - bkAt, bkTop, bkBot, up, up ? bullMBCol : bearMBCol, up ? "+MB" : "-MB", false)
+
+// ---------------------------------------------------------------- Per-bar logic
+float ph = ta.pivothigh(high, swingN, swingN)
+float pl = ta.pivotlow(low, swingN, swingN)
+
+// SMT: the compared symbol's extreme over the same bars as a swing on this chart.
+[oHigh, oLow] = request.security(useSMT and smtSym != "" ? smtSym : syminfo.tickerid, timeframe.period, [high, low])
+float oHH = ta.highest(oHigh, 2 * swingN + 1)
+float oLL = ta.lowest(oLow, 2 * swingN + 1)
+bool smtOn = useSMT and smtSym != ""
+
+var float hiP = na
+var int   hiI = na
+var bool  hiBroken = true
+var float loP = na
+var int   loI = na
+var bool  loBroken = true
+var float otherAtHigh = na
+var float otherAtLow  = na
+
+if barstate.isconfirmed
+    updateZones(fvgZones)
+    updateZones(obZones)
+    updateZones(brkZones)
+    updateZones(mbZones)
+    updateLiq(bslLevels, true)
+    updateLiq(sslLevels, false)
+
+    // Structure breaks.
+    if not na(hiP) and not hiBroken and close > hiP
+        hiBroken := true
+        onBreak(true, hiI)
+    if not na(loP) and not loBroken and close < loP
+        loBroken := true
+        onBreak(false, loI)
+
+    // Fair value gap: the wicks of the first and third candle do not overlap.
+    if showFVG and bar_index > 1
+        if low - high[2] > fvgMin * syminfo.mintick
+            addZone(fvgZones, maxFVG, bar_index - 1, low, high[2], true, bisiCol, "BISI", showCE)
+        else if low[2] - high > fvgMin * syminfo.mintick
+            addZone(fvgZones, maxFVG, bar_index - 1, low[2], high, false, sibiCol, "SIBI", showCE)
+
+    // A swing is only known once swingN bars have closed after it.
+    if not na(ph)
+        float other = smtInv ? oLL : oHH
+        if smtOn and not na(hiP) and not na(otherAtHigh) and ph > hiP
+            if (smtInv ? other > otherAtHigh : other < otherAtHigh)
+                line.new(hiI, hiP, bar_index - swingN, ph, color = smtCol, width = 2)
+                label.new(bar_index - swingN, ph, "SMT", style = label.style_label_down, color = color.new(smtCol, 100), textcolor = smtCol, size = size.small)
+        otherAtHigh := other
+        hiP := ph
+        hiI := bar_index - swingN
+        hiBroken := false
+        shP.push(hiP)
+        shI.push(hiI)
+        if shP.size() > 100
+            shP.shift()
+            shI.shift()
+        if showLiq
+            addLiq(bslLevels, hiI, hiP, true)
+
+    if not na(pl)
+        float other = smtInv ? oHH : oLL
+        if smtOn and not na(loP) and not na(otherAtLow) and pl < loP
+            if (smtInv ? other < otherAtLow : other > otherAtLow)
+                line.new(loI, loP, bar_index - swingN, pl, color = smtCol, width = 2)
+                label.new(bar_index - swingN, pl, "SMT", style = label.style_label_up, color = color.new(smtCol, 100), textcolor = smtCol, size = size.small)
+        otherAtLow := other
+        loP := pl
+        loI := bar_index - swingN
+        loBroken := false
+        slP.push(loP)
+        slI.push(loI)
+        if slP.size() > 100
+            slP.shift()
+            slI.shift()
+        if showLiq
+            addLiq(sslLevels, loI, loP, false)
+
+plotshape(showSwings and not na(ph), "Swing high", shape.circle, location.abovebar, color.new(color.red, 20), offset = -swingN, size = size.tiny)
+plotshape(showSwings and not na(pl), "Swing low", shape.circle, location.belowbar, color.new(color.blue, 20), offset = -swingN, size = size.tiny)
+
+// ---------------------------------------------------------------- Dealing range
+float rph = ta.pivothigh(high, rangeN, rangeN)
+float rpl = ta.pivotlow(low, rangeN, rangeN)
+var float rangeHi = na
+var int   rangeHiI = na
+var float rangeLo = na
+var int   rangeLoI = na
+if not na(rph)
+    rangeHi := rph
+    rangeHiI := bar_index - rangeN
+if not na(rpl)
+    rangeLo := rpl
+    rangeLoI := bar_index - rangeN
+
+var line  drHi = na
+var line  drEq = na
+var line  drLo = na
+var label drHiL = na
+var label drEqL = na
+var label drLoL = na
+if showRange and barstate.islast and not na(rangeHi) and not na(rangeLo) and rangeHi > rangeLo
+    float eq = (rangeHi + rangeLo) / 2
+    int x1 = math.max(math.min(rangeHiI, rangeLoI), bar_index - 4000)
+    int x2 = bar_index + 20
+    line.delete(drHi)
+    line.delete(drEq)
+    line.delete(drLo)
+    label.delete(drHiL)
+    label.delete(drEqL)
+    label.delete(drLoL)
+    drHi := line.new(x1, rangeHi, x2, rangeHi, color = rangeCol)
+    drEq := line.new(x1, eq, x2, eq, color = rangeCol, style = line.style_dashed)
+    drLo := line.new(x1, rangeLo, x2, rangeLo, color = rangeCol)
+    drHiL := label.new(x2, rangeHi, "Range high (external BSL)", style = label.style_label_left, color = color.new(rangeCol, 100), textcolor = rangeCol, size = size.tiny)
+    drEqL := label.new(x2, eq, "Premium above / Discount below", style = label.style_label_left, color = color.new(rangeCol, 100), textcolor = rangeCol, size = size.tiny)
+    drLoL := label.new(x2, rangeLo, "Range low (external SSL)", style = label.style_label_left, color = color.new(rangeCol, 100), textcolor = rangeCol, size = size.tiny)
+
+// ---------------------------------------------------------------- Killzones
+bool intradayOK = timeframe.isintraday and timeframe.in_seconds() <= 3600
+
+killzone(bool show, string sess, string name, color c) =>
+    var box b = na
+    bool inside = show and intradayOK and not na(time(timeframe.period, sess, NY_TZ))
+    if inside and not inside[1]
+        b := box.new(bar_index, high, bar_index, low, border_color = color.new(c, 30), bgcolor = color.new(c, 92), text = name, text_color = c, text_size = size.tiny, text_halign = text.align_left, text_valign = text.align_top)
+    else if inside
+        box.set_right(b, bar_index)
+        box.set_top(b, math.max(high, box.get_top(b)))
+        box.set_bottom(b, math.min(low, box.get_bottom(b)))
+
+killzone(showAsia,   "2000-0000", "Asia",         color.gray)
+killzone(showLondon, "0200-0500", "London",       color.blue)
+killzone(showNY,     "0700-1000", "New York",     color.green)
+killzone(showLC,     "1000-1200", "London Close", color.orange)
+killzone(showAM,     "0830-1200", "AM Session",   color.green)
+killzone(showPM,     "1330-1600", "PM Session",   color.purple)
+
+// ---------------------------------------------------------------- Midnight open (Power of 3)
+// Buy at or below the 12am New York open on a buy day, sell at or above it on a sell day.
+var array<line> mnoLines = array.new<line>()
+var label mnoLabel = na
+bool isMidnight = hour(time, NY_TZ) == 0 and minute(time, NY_TZ) == 0
+if showMNO and intradayOK
+    if isMidnight
+        mnoLines.push(line.new(bar_index, open, bar_index + 1, open, color = mnoCol, style = line.style_dotted))
+        if mnoLines.size() > mnoDays
+            line.delete(mnoLines.shift())
+        label.delete(mnoLabel)
+        mnoLabel := label.new(bar_index + 1, open, "12am Open", style = label.style_label_left, color = color.new(mnoCol, 100), textcolor = mnoCol, size = size.tiny)
+    else if mnoLines.size() > 0
+        line.set_x2(mnoLines.last(), bar_index + 1)
+        label.set_x(mnoLabel, bar_index + 1)
